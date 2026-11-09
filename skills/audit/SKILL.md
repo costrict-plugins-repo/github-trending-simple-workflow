@@ -1,0 +1,340 @@
+---
+name: audit
+description: >-
+  Comprehensive multi-agent code audit that delegates to the code-reviewer
+  and security-scanner sub-agents. Always runs security-scanner; set
+  only_security_scan=true to restrict to a security-only review. Use when
+  (1) verifying changes before shipping, (2) running review feedback inside
+  the /impl Generator-Evaluator loop, or (3) reviewing a topic branch with
+  no active ticket directory. Triggers on "audit changes", "review the
+  diff", "code review", "security review", "/audit". Chain-invoked by
+  /impl Step 17 and /ship review-gate; disable-model-invocation: false is
+  intentional because callers reference this skill by name.
+disable-model-invocation: false
+allowed-tools:
+  - Agent
+  - Read
+  - Write
+  - Glob
+  - Grep
+  - "Bash(source:*)"  # Step 4b sources ${CLAUDE_PLUGIN_ROOT}/hooks/lib/audit-coverage.sh
+argument-hint: "[only_security_scan=true|false] [round=N] [ticket-dir=<dir-name>] [depth=standard|thorough|exhaustive] [branch or commit range (optional)]"
+---
+
+Audit current code changes. Args: $ARGUMENTS
+
+Invocation policy: Do not auto-invoke. Only invoke when explicitly called by name by the user or by another skill (e.g. `/impl` Step 17, `/ship` review-gate). `disable-model-invocation: false` is intentional because this skill is chain-called from other skills by name.
+
+## Pre-computed Context
+
+Available user skills: !`( ls -1 ~/.claude/skills 2>/dev/null ; ls -1 .claude/skills 2>/dev/null ) | sort -u | grep . | tr "\n" "," | sed "s/,$//" | grep . || echo "(none)"`
+
+## Mandatory Skill Invocations
+
+The following agent invocations are **contractual** — `/audit` MUST delegate to each of these via the Agent tool (in parallel when both are requested). `/audit` itself performs no review work; its entire role is to spawn the review agents, aggregate their counts, and return a structured result block. Any bypass is a contract violation and will be detected by the skill invocation audit (Phase A+).
+
+| Invocation Target | When | Skip consequence |
+|---|---|---|
+| `security-scanner` agent (Agent tool) | Step 2 — **always**, regardless of `only_security_scan` flag | No security review; hardcoded secrets / injection vulnerabilities may reach `done/` undetected. Detected by absence of `security-scan-{n}.md` in ticket dir and absence of security-scanner trace in skill invocation audit |
+| `code-reviewer` agent (Agent tool) | Step 2 — in parallel with security-scanner when `only_security_scan=false` (default) | No code quality review; `/impl`'s retry loop has no feedback on style/maintainability/correctness concerns. Detected by absence of `quality-round-{n}.md` in ticket dir |
+| `doc-verifier` agent (Agent tool) | Step 2 — in parallel when `constraints.selfdoc_verification` is active AND a documentation / advertised-interface surface is touched | No EC-SELFDOC verification; a docstring / README / `--help` example that no longer reproduces, or an advertised boundary ≠ the enforced one, reaches `done/` undetected. Detected by absence of `doc-verify-{n}.md` in ticket dir when the trigger fired |
+
+**Binding rules**:
+- `MUST invoke simple-workflow:security-scanner via the Agent tool` every time `/audit` runs — never skip security review even when changes look "obviously safe".
+- `MUST invoke simple-workflow:code-reviewer via the Agent tool` unless `only_security_scan=true` was explicitly passed. Never substitute by having `/audit` itself read files and render a verdict.
+- `MUST invoke simple-workflow:doc-verifier via the Agent tool` when `constraints.selfdoc_verification` is active AND the change touches a documentation / advertised-interface surface (a `README` / `*.md` / `--help` / man-page, or a Gate 9 R3 / R4 AC). Never substitute by having `/audit` itself reproduce the examples and judge; skip only via the documented `constraints.selfdoc_verification: off` / no-doc-surface paths.
+- `NEVER bypass these agents via direct file operations` — `/audit` must NOT read the changed files itself (Step 2 explicitly states: "Do NOT read files directly — delegate ALL review work to the agents").
+- `Fail this audit immediately if any required agent cannot be invoked via the Agent tool` — the Error Handling section treats agent failure as Critical = 1; **never silently treat a failed agent as PASS or PASS_WITH_CONCERNS**.
+
+Current branch:
+!`git branch --show-current 2>/dev/null || true`
+
+Active tickets:
+!`ls -d .simple-workflow/backlog/active/*/ 2>/dev/null || echo "(none)"`
+
+Staged changes:
+!`git diff --cached --stat 2>/dev/null || true`
+
+Unstaged changes:
+!`git diff --stat 2>/dev/null || true`
+
+Changed files:
+!`{ git diff --cached --name-only && git diff --name-only; } 2>/dev/null || true`
+
+## Instructions
+
+### 0. Argument Parsing
+
+Parse `$ARGUMENTS` for the following:
+- `only_security_scan=true` (case-insensitive): set the flag to skip code-reviewer.
+- `only_security_scan=false`: explicit default (run both agents).
+- If neither token is present, default `only_security_scan=false`.
+- `round=N` (case-insensitive, N is a positive integer): explicit round number for output filenames. When provided, the skill MUST write to `quality-round-{N}.md`, `security-scan-{N}.md`, and `audit-round-{N}.md` using this number instead of auto-incrementing. This lets the calling skill (e.g. `/impl`) synchronize audit round numbers with its own Generator-Evaluator loop counter. If N is ≤ 0 or not an integer, print a warning and fall back to auto-increment.
+- If `round=` is absent, use the current behavior (auto-increment: max existing round + 1).
+- `ticket-dir=<dir-name>` (case-insensitive key): ticket directory name (directory name only, not a full path — e.g., `003-fix-login`). When provided, this value is used in Step 1 to construct the full path `.simple-workflow/backlog/active/{dir-name}` instead of inferring the ticket directory from the branch name. This token is consumed by argument parsing and is NOT passed through as a commit/branch range hint.
+- `depth=<tier>` (case-insensitive key; v8.1.0+): the verification-depth tier resolved upstream by `/impl` Step 3a. Recognized values: `standard`, `thorough`, `exhaustive`. When `depth=thorough` or `depth=exhaustive`, trigger **T-F** fires in Step 3.5 (forces the skeptical third-pass). `depth=standard`, an absent `depth=`, or any unrecognized value (e.g. `depth=off`) does NOT fire T-F and leaves the conditional T-A..T-E behaviour unchanged. This token is consumed by argument parsing and is NOT passed through as a commit/branch range hint.
+- Any other tokens are treated as an optional commit/branch range hint, passed through to the agents as additional context.
+
+### 1. Determine Output Destinations
+
+- Get the current branch name from the pre-computed context above.
+- List directories in `.simple-workflow/backlog/active/` from the pre-computed context above.
+
+**If `ticket-dir=<dir-name>` was provided in Step 0:**
+- Construct the full path: `.simple-workflow/backlog/active/{dir-name}`
+- Check whether `.simple-workflow/backlog/active/{dir-name}` exists as a directory.
+  - If the directory exists: set `ticket-dir` to `.simple-workflow/backlog/active/{dir-name}` and skip branch name matching entirely.
+  - If the directory does NOT exist: print `WARNING: ticket-dir '.simple-workflow/backlog/active/{dir-name}' does not exist; falling back to branch name matching.` and proceed to the branch name matching below as if `ticket-dir=` was not provided.
+
+**If `ticket-dir=` was not provided (or directory does not exist):**
+- Match the current branch name against active ticket directories. For each directory in `.simple-workflow/backlog/active/`, extract the slug portion by stripping the leading `NNN-` prefix (the initial sequence of digits followed by a hyphen, e.g., `001-add-search-feature` → `add-search-feature`). Check if the branch name contains this slug portion.
+- If a match is found: set `ticket-dir` to `.simple-workflow/backlog/active/{full-directory-name}` (including the numeric prefix).
+
+**Once `ticket-dir` is resolved (by either method above):**
+- If `ticket-dir` is set:
+  - If `round=N` was parsed in Step 0, use `{N}` as the round number for all output files.
+  - Otherwise, auto-increment: check existing `quality-round-*.md` files in `ticket-dir`, take max + 1, or 1 if none.
+  - Code-reviewer output (when invoked): `{ticket-dir}/quality-round-{n}.md`
+  - Security-scanner output (always invoked): `{ticket-dir}/security-scan-{n}.md`
+- If no match: use defaults (code-reviewer: `.simple-workflow/docs/reviews/{topic}.md`, security-scanner: `.simple-workflow/docs/reviews/security-{topic}.md`) where `{topic}` is derived from the current branch name.
+
+### 1a. Resolve Category and Checklist Body
+
+Before spawning agents, resolve the per-ticket Category and the matching
+checklist body that will be propagated to each agent. The canonical
+checklist source is [references/categories.md](references/categories.md)
+(repo path `skills/audit/references/categories.md`); this path is
+recorded verbatim in the dispatch log so the propagation is auditable.
+
+When `ticket-dir` is set (Step 1 resolved a path under
+`.simple-workflow/backlog/active/{dir-name}`), read `{ticket-dir}/ticket.md`
+and locate the row whose first cell is exactly `Category` (the ticket
+metadata table uses Markdown table rows of the form
+`| Category | <value> |`).
+
+Apply the following parsing rules:
+
+- **Multiple Category rows** (Edge Case 1): if `ticket.md` contains more
+  than one row whose first cell is `Category`, use the **first**
+  occurrence's value verbatim AND emit the literal line
+  `warn: multiple Category rows in ticket.md` to stderr. Do NOT abort.
+- **Trailing whitespace** (Edge Case 3): strip leading and trailing
+  whitespace from the extracted Category value before any further use
+  (e.g., `Security ` becomes `Security`; the dispatch log MUST record
+  the stripped form).
+- **No Category row** (Negative AC 1): if no row matches, treat the
+  Category as `unspecified` for dispatch-log purposes and skip checklist
+  selection.
+- **Unknown / lowercase Category** (Negative AC 4): the value is passed
+  through verbatim. No rejection. No mapping. If the value does not
+  match one of the six canonical `## Category: <name>` headers in
+  `skills/audit/references/categories.md`, no checklist body is
+  selected; the agents receive the file path and the verbatim Category
+  value, and they fall back to their default review heuristics.
+
+Selecting the checklist body (canonical six only):
+
+- The canonical six values are `CodeQuality`, `Security`, `Performance`,
+  `Reliability`, `Documentation`, `Testing`.
+- When the resolved Category exactly matches one of the six, extract the
+  body of `skills/audit/references/categories.md` between the line
+  `## Category: <CategoryName>` and the next `## Category:` header (or
+  end-of-file). This body — including its `- [ ] <item>` checklist
+  items — is the **selected checklist body**.
+- The selected checklist body MUST be passed verbatim to both
+  `code-reviewer` and `security-scanner` as part of the agent prompt,
+  with explicit instruction to evaluate each item and to emit a line of
+  the form `- [ ] <item> (Category: <CategoryName>)` (or `- [x] ...`
+  for items addressed by the changes) into its report file.
+
+When `ticket-dir` is NOT set (no active ticket detected): skip the
+ticket.md read, skip checklist selection, and skip the dispatch-log
+write described in Step 1b. Audit proceeds without category
+propagation.
+
+### 1b. Write Dispatch Log
+
+When `ticket-dir` is set, write the dispatch log to
+`{ticket-dir}/audit-dispatch.log` BEFORE spawning the agents. The file
+is a plain text key=value log used by tests and downstream tooling to
+verify the propagation contract.
+
+Content format (exact, no extra fields, one key per line):
+
+```
+category=<value>
+checklist_source=skills/audit/references/categories.md
+```
+
+Rules:
+
+- `<value>` is the verbatim Category value resolved in Step 1a (after
+  trailing-whitespace stripping). If no Category row was present in
+  `ticket.md`, write `category=unspecified`.
+- The literal string `checklist_source=skills/audit/references/categories.md`
+  MUST appear on its own line, even when the resolved category is
+  `unspecified` or an unknown value. The log records that this is the
+  source consulted, not that a body was selected.
+- Use UTF-8, LF line endings, no surrounding quotes.
+- The file is overwritten on every `/audit` invocation against the
+  same ticket directory (one log per audit run; the round number is
+  captured in `audit-round-{n}.md` instead).
+
+When `ticket-dir` is NOT set, do NOT write a dispatch log.
+
+### 2. Spawn Agents
+
+**MUST invoke the `simple-workflow:security-scanner` agent via the Agent tool** (sonnet) — **NEVER bypass security-scanner** even when changes appear security-irrelevant; the agent itself decides what is in scope. Fail this audit immediately if security-scanner cannot be invoked.
+- Pass the changed files list and the security-scan output path determined in step 1.
+- When a checklist body was selected in Step 1a, pass it verbatim as part
+  of the agent prompt and instruct security-scanner to evaluate each
+  `- [ ] <item>` line and emit `- [ ] <item> (Category: <CategoryName>)`
+  (or `- [x] ...`) lines into its report.
+- Receive Critical / Warnings / Suggestions counts and a summary.
+- Note: security-scanner is always invoked regardless of whether sensitive files appear to be touched. The agent itself decides what is security-relevant.
+
+**If** `only_security_scan` is `false` (default), you **MUST also invoke the `simple-workflow:code-reviewer` agent via the Agent tool** (sonnet) **in parallel** with security-scanner. **NEVER bypass code-reviewer via direct file inspection** from within `/audit`. Fail this audit immediately if code-reviewer cannot be invoked (treat as Critical = 1 per the Error Handling section):
+- Pass the changed files list and the quality-round output path determined in step 1.
+- When a checklist body was selected in Step 1a, pass it verbatim as part
+  of the agent prompt and instruct code-reviewer to evaluate each
+  `- [ ] <item>` line and emit `- [ ] <item> (Category: <CategoryName>)`
+  (or `- [x] ...`) lines into its report.
+- Receive Critical / Warnings / Suggestions counts and a summary.
+
+If `only_security_scan` is `true`, the code-reviewer is **skipped** (security-only mode).
+
+**If** `constraints.selfdoc_verification` is active (read it from `{ticket-dir}/autopilot-policy.yaml`; absent file / field / unknown value → `auto` = active) **AND** the change touches a documentation / advertised-interface surface (a changed `README` / `*.md` / `--help` / man-page / quickstart, OR the ticket carries a Gate 9 R3 `DESCRIPTION-MATCHES-BEHAVIOR` / R4 `DOC/INTERFACE TRUTHFULNESS` AC), you **MUST also invoke the `simple-workflow:doc-verifier` agent via the Agent tool** (sonnet) **in parallel** with the other reviewers. doc-verifier RUNs the unit's OWN advertised examples and boundary claims against the real build under the `.simple-workflow/scratch/` exec carve-out and reports **EC-SELFDOC** drift (description-vs-behavior, class A) or advertised-vs-enforced boundary mismatch (class E) — independent of code-reviewer (quality) and security-scanner (security). **NEVER substitute by having `/audit` itself read the docs and judge.**
+- Pass the changed files list and the doc-verify output path (`{ticket-dir}/doc-verify-{n}.md`, or the default `.simple-workflow/docs/reviews/doc-verify-{topic}.md`). When `ticket-dir` is set and `{ticket-dir}/ticket.md` carries a `#### Failure-Class Coverage (Gate 9)` matrix, inline its R3 / R4 rows so doc-verifier knows which advertised examples / boundaries to exercise.
+- Receive Critical / Warnings / Suggestions counts and a summary. A doc example that does not reproduce, or an advertised boundary that differs from the enforced one, is a Critical finding; where the build genuinely cannot be exercised, doc-verifier returns `PASS-WITH-CAVEATS` (fail-open), never a spurious Critical.
+- doc-verifier is **skipped** (record a one-line note in the aggregated report) when `constraints.selfdoc_verification: off` OR no documentation / advertised-interface surface is touched. This is the per-brief kill switch for the EC-SELFDOC verification line.
+
+Do NOT read files directly — delegate ALL review work to the agents.
+
+### 3. Aggregate Results
+
+Combine the results from the spawned agents into a single aggregated report:
+
+- `Critical` = sum of Critical counts from all spawned agents (security-scanner always; code-reviewer when not skipped; doc-verifier when the EC-SELFDOC trigger fired).
+- `Warnings` = sum of Warnings counts from all spawned agents.
+- `Suggestions` = sum of Suggestions counts from all spawned agents.
+- Determine `Status`:
+  - If `Critical > 0` → `FAIL`
+  - Else if `Warnings > 0` or `Suggestions > 0` → `PASS_WITH_CONCERNS`
+  - Else → `PASS`
+
+The aggregated counts MUST be calculated across all spawned agents (security-scanner always; code-reviewer when not skipped; doc-verifier when the EC-SELFDOC trigger fired).
+
+- When Step 3.5 (Skeptical Third-Pass) fires and returns `DO_NOT_SHIP`, treat this as `Critical += 1` in the aggregated tally. This causes `Status` to be `FAIL` via the existing `Critical > 0` rule. When Step 3.5 does not fire, the tally is unaffected.
+
+### Step 3.5: Skeptical Third-Pass (conditional)
+
+After Step 3 aggregation, evaluate the trigger conditions defined in [references/skeptical-pass.md](references/skeptical-pass.md). When **at least one trigger fires** AND `only_security_scan` is `false` (the short-circuit flag is not set), invoke a third `Agent` tool call:
+
+- `subagent_type: general-purpose`
+- Pass the prompt template from [references/skeptical-pass.md](references/skeptical-pass.md) verbatim, substituting `{changed_files}`, `{rubric_ids}`, and `{trigger_list}` from context (the rubric IDs already covered by `code-reviewer` and `security-scanner`).
+- Save the agent's response to `{ticket-dir}/skeptical-pass-{n}.md` (using the same round number `{n}` from Step 1). If no `ticket-dir` is set, save to `.simple-workflow/docs/reviews/skeptical-pass-{topic}.md`.
+- Receive the agent's verdict: `SHIP` or `DO_NOT_SHIP`. Feed the verdict into Step 3 aggregation per the rule documented at the end of `### 3. Aggregate Results`.
+
+When **no trigger fires**, skip this step entirely. `/audit`'s behaviour is byte-identical (modulo log entries) to the pre-T-5 behaviour.
+
+When `only_security_scan=true`, the third-pass **MUST NOT fire**, even if a trigger condition would otherwise be met. The flag's purpose is to restrict review to security-scanner only.
+
+The third-pass fires **at most once per `/audit` run**, regardless of how many triggers fire simultaneously. Triggers form an OR-set: all firing triggers are reported in the prompt context, but a single `general-purpose` Agent call is made.
+
+If the `general-purpose` Agent call itself fails (timeout, infrastructure error), treat the failure as `Critical += 1` (failed review infrastructure), consistent with the existing aggregation behaviour for failed contractual reviewers.
+
+The six trigger labels (`T-A`, `T-B`, `T-C`, `T-D`, `T-E`, `T-F`) and the verbatim prompt template are documented in [references/skeptical-pass.md](references/skeptical-pass.md); load that file when Step 3.5 fires. `T-F` is the explicit upstream signal: the caller passed `depth=thorough` or `depth=exhaustive` (the verification-depth tier from `/impl` Step 3a), which forces the third-pass regardless of the diff heuristics `T-A`..`T-E`; include `T-F` in `{trigger_list}` when it fired. The prompt template instructs the third-pass agent to skip the T-4 Pre-existing Failure Attribution scope already covered by `agents/ac-evaluator.md`.
+
+### 4. Return Structured Result
+
+First, print a human-readable summary of the most important findings (Critical issues first, then Warnings, then Suggestions) with file:line references where available.
+
+Then, print exactly the following structured block at the end of your output (this is parseable by the calling skill):
+
+```
+**Status**: <PASS | PASS_WITH_CONCERNS | FAIL>
+**Critical**: <N>
+**Warnings**: <N>
+**Suggestions**: <N>
+**Reports**:
+  - Code review: <path or "skipped (only_security_scan=true)">
+  - Security scan: <path>
+**Summary**: <one-line aggregated summary across all spawned agents>
+```
+
+### 4-bis. MANDATORY: Handoff back to caller
+
+The structured block is INTERMEDIATE — input to `/impl` Step 18, not a turn-terminal artifact. When a `phase-state.yaml` exists under `.simple-workflow/backlog/active/*/`, the caller is `simple-workflow:impl` and the audit must hand control back rather than ending the turn.
+
+**Detection rule (hardcoded):** the presence of `phase-state.yaml` under `.simple-workflow/backlog/active/` is the trigger. `/audit` deliberately does not iterate a caller registry — when a future skill (e.g. `/refactor`) is added as a caller, expand this rule explicitly at that point.
+
+**MUST when phase-state.yaml is present:**
+
+- **Do NOT end your turn** after emitting the structured block above. The block is an input to `/impl`, not the final user-facing result.
+- **Read `phase-state.yaml`** for the active ticket — `phases.impl.next_action` records the calling skill's resume target.
+- **Continue executing** `phases.impl.next_action` immediately. For `/impl` callers, that means proceeding through Step 18 → Phase 3 (Steps 19-21) → Step 22 (`## [SW-CHECKPOINT]` emit) without summarizing the audit result back to the user.
+- The Phase 3 `## [SW-CHECKPOINT]` emit is what marks the end of the `/impl` invocation; until then, the turn is mid-orchestration.
+
+**Standalone fallback** (no `phase-state.yaml` under `.simple-workflow/backlog/active/`): the structured block above IS the terminal artifact. End the turn after Step 4a persistence runs. This covers manual `/audit` invocations and reviews of branches that have no active ticket directory.
+
+This handoff is enforced by `hooks/impl-checkpoint-guard.sh` (Stop hook). When the agent emits the structured block but ends the turn before `## [SW-CHECKPOINT]` lands, the hook returns `decision:"block"` for up to 3 consecutive attempts (kill switch: `SW_IMPL_CHECKPOINT_MODE`).
+
+### 4a. Persist Aggregated Result (when ticket-dir is set)
+
+If an active ticket directory was detected in Step 1 (`ticket-dir`):
+- Write the structured result block below to `{ticket-dir}/audit-round-{n}.md`, where `{n}` is the same round number used for `quality-round-{n}.md` / `security-scan-{n}.md` in Step 1 (the explicit `round=N` value if provided, else the auto-incremented value).
+- The file content is the same 7-line `**Status**:...**Summary**:...` block printed in Step 4.
+- **Category-tagged checklist transcription** (when a checklist body was
+  selected in Step 1a): append, after the structured block, the
+  evaluated checklist items reported by the spawned agents. Each
+  transcribed item MUST appear on its own line, outside fenced code
+  blocks and outside HTML comments, in the exact form
+  `- [ ] <item> (Category: <CategoryName>)` for unaddressed items or
+  `- [x] <item> (Category: <CategoryName>)` for items the changes
+  addressed. At least one such line MUST be present whenever the
+  ticket's Category matches one of the canonical six. When the
+  Category is `unspecified` or an unknown value, no such lines are
+  required.
+- This file is consumed by `hooks/pre-compact-save.sh` to compute `last_round_outcome` in the compact-state snapshot, which in turn drives `/catchup` Rule 0-legacy (impl-loop resume detection).
+
+If no ticket directory was detected, skip this persistence step (no audit-round file is written for non-ticket flows).
+
+### 4b. Emit audit-coverage block via `audit_coverage_emit` (`hooks/lib/audit-coverage.sh`)
+
+After writing `{ticket-dir}/quality-round-{n}.md` (Step 4a), source
+`${CLAUDE_PLUGIN_ROOT}/hooks/lib/audit-coverage.sh` (the helper ships inside the
+plugin — `hooks/lib/audit-coverage.sh` is a plugin-root path, NOT a path in the
+user's repository, so a cwd-relative `source hooks/lib/audit-coverage.sh` only
+works when the plugin repository itself is the cwd) and call:
+
+    audit_coverage_emit "{ticket-dir}/quality-round-{n}.md"
+
+The block schema, the `SW_AUDIT_COVERAGE=off` kill switch, and the
+fail-open fallback log are documented in [references/audit-coverage.md](references/audit-coverage.md).
+
+## Error Handling
+
+- **No changes at all**: Print "No changes to audit." and return Status: PASS with all counts at 0.
+- **Single agent failure (the other succeeded)**: Return Status: FAIL with Critical = 1 (counting "review infrastructure failure" as a Critical finding).
+  The Summary MUST explicitly name the failed agent and the failure reason.
+  Do NOT silently set counts to 0 — a partial review is not enough evidence to return PASS or PASS_WITH_CONCERNS.
+  **Never silently treat a failed agent as PASS or PASS_WITH_CONCERNS.**
+  Example: "**Status**: FAIL | **Summary**: security-scanner failed (timeout) — review incomplete; retry required"
+- **Both agents fail (or the only requested agent failed)**:
+  Do NOT return the structured result block at all. Instead, print the failure details to stderr and exit abnormally.
+  This forces the calling skill's fallback (e.g. `/impl` Step 16) to detect "no structured block" and escalate via `AskUserQuestion`.
+  Example stderr output:
+  "/audit: all spawned agents failed. code-reviewer: <error>. security-scanner: <error>."
+- **Invalid only_security_scan value** (e.g., `only_security_scan=yes`): Print warning and treat as `false` (default behavior).
+- **Shell execution disabled** (`disableSkillShellExecution: true` policy-replaces the `!`...`` context blocks at the top of this skill): the `Current branch:`, `Active tickets:`, `Staged changes:`, `Unstaged changes:`, and `Changed files:` blocks render as policy-replacement placeholders instead of live command output. In that fallback mode, invoke the equivalent commands explicitly via the Bash tool (`git branch --show-current`, `git diff --cached --stat`, `git diff --stat`, `git diff --cached --name-only`, and `ls -d .simple-workflow/backlog/active/*/`), then continue Step 1 using those Bash-tool results as if they were the pre-computed context.
+
+## Subagent Skill-Access Handoff
+
+When you spawn a subagent via the Agent tool, consult the `Available user skills:` line in the Pre-computed Context above. If a listed utility skill is relevant to that subagent's task, name it in the Agent prompt and instruct the subagent to use it via the Skill tool when it materially helps.
+
+- **Truly hermetic agents** (`security-scanner`, `ticket-evaluator`) carry no Skill tool, no MCP, no `Bash(*)`. If you spawn one, hand off nothing — speculative references only add noise.
+- **Skill-bearing verdict / read-only agents** (`ac-evaluator`, `code-reviewer`, `decomposer`, `tune-analyzer`) retain explicit `tools:` allowlists and do NOT inherit MCP / `Bash(*)`. They DO carry the Skill tool and receive capability handoffs, but only via **deterministic per-AC binding** (the `## Bound capabilities (per AC)` block extracted from `{ticket-dir}/ticket.md`'s `### Capabilities` section) — never via ad-hoc speculation from the `Available user skills:` probe.
+- **Productive agents** (`implementer`, `planner`, `researcher`, `test-writer`) inherit-all under v8.0.0 — every parent-session MCP server and `Bash(*)` is in their tool inventory. Only `mcp__*` and Skills bound to an active AC via `## Bound capabilities (per AC)` may be invoked (per the agent body's `## Bound Capabilities (Handoff from Orchestrator)` section).
+- Never present a pipeline skill (`/scout`, `/impl`, `/audit`, `/ship`, `/autopilot`, `/brief`, `/catchup`, `/create-ticket`, `/investigate`, `/plan2doc`, `/refactor`, `/test`, `/tune`) as a utility for a subagent.
+- When a ticket's `### Capabilities` section exists (resolve via `{ticket-dir}/ticket.md` or the autopilot state file's `paths.ticket`), `Read` it before constructing any subagent spawn prompt and inline the bound capabilities verbatim into every spawn prompt under the heading `## Bound capabilities (per AC)`. For per-AC spawns (one spawn per AC, e.g. `/impl` Steps 13/15), include only the rows whose `Bound AC(s)` column lists the active AC. For tip / whole-deliverable spawns (the rest), include the full table. The upstream binding is authoritative — do NOT re-derive relevance from the AC text or re-scan `Available user skills:` for plausible matches. When the ticket lacks `### Capabilities` (older ticket pre-dating Gate 6), emit `## Bound capabilities (per AC): (none recorded — ticket pre-dates Gate 6)` in the spawn prompt and let the subagent fall back to its in-house capability-selection path.
+- If the `Available user skills:` probe reports `(none)`, hand off nothing and let the subagent proceed with its in-house capabilities.

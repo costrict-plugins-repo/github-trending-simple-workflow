@@ -1,0 +1,1117 @@
+#!/usr/bin/env bash
+# tests/test-scout-checkpoint-guard.sh
+#
+# Fixture-driven regression suite for hooks/scout-checkpoint-guard.sh — the
+# Stop hook that guards /plan2doc's ssot-line emit from prematurely ending
+# the turn before /scout Step 8 / 8a / 9 / 10 finalize (including the
+# ## [SW-CHECKPOINT] emit).
+#
+# Mirrors the structural prior in tests/test-impl-checkpoint-guard.sh; the
+# differences are signal selection (plan2doc ssot-line vs audit
+# Status/Reports literals) and the phase-state.yaml absent branch — the
+# /scout failure mode is canonically observed on legacy product_backlog
+# tickets that have no phase-state.yaml, so C5 explicitly exercises that
+# path (NAC-2).
+#
+# Fourteen cases exercise:
+#   C1  — short-circuit on missing transcript_path
+#   C2  — short-circuit on missing ssot-line in tail
+#   C3  — short-circuit on ## [SW-CHECKPOINT] present (counter cleared)
+#   C4  — short-circuit on no /scout Skill invocation (cross-session guard)
+#   C5  — block on 3-AND match WITHOUT phase-state.yaml (NAC-2)
+#   C6  — block on 3-AND match WITH phase-state.yaml in-progress
+#   C7  — short-circuit when phase-state.yaml has scout.status == completed
+#   C8  — release at counter == 3 with [SCOUT-CHECKPOINT-RELEASE] stdout
+#   C9  — Step 2a gate fires after fresh briefs/done/ autopilot completion (v8.0.1, AC-1)
+#   C10 — Step 2a gate yields to active autopilot when both states coexist (v8.0.1, AC-3)
+#   C11 — Step 2a gate ignores stale briefs/done/ state past default TTL (v8.0.1, AC-4)
+#   C12 — Step 2 kill switch precedes Step 2a; SW_SCOUT_CHECKPOINT_MODE=off skips both (v8.0.1, AC-2)
+#   C13 — Step 2a gate fails closed when any tickets[].status != completed (v8.0.1, AC-1 negative)
+#   C14 — Step 2a gate respects custom SW_AUTOPILOT_DONE_GATE_TTL_SEC (v8.0.1, AC-4 variant)
+#
+# Each fixture is built fresh in a tmpdir; mock state files and JSONL
+# transcripts are constructed inline so the test is hermetic and
+# self-documenting.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tests/test-helper.sh
+source "$SCRIPT_DIR/test-helper.sh"
+
+HOOK="$HOOK_DIR/scout-checkpoint-guard.sh"
+
+echo "=== scout-checkpoint-guard.sh Tests ==="
+echo ""
+
+# Helpers --------------------------------------------------------------------
+
+make_phase_state() {
+  local repo_dir="$1"
+  local ticket_dir="$2"
+  local content="$3"
+  mkdir -p "$repo_dir/.simple-workflow/backlog/active/$ticket_dir"
+  printf '%s\n' "$content" > "$repo_dir/.simple-workflow/backlog/active/$ticket_dir/phase-state.yaml"
+}
+
+# Step 2a (v8.0.1) fixture helpers: write a briefs/done/<parent>/ or
+# briefs/active/<parent>/ autopilot-state.yaml. The content is canonical
+# tickets[] list form; parse_ticket_statuses already tolerates list and
+# map forms (WI-4).
+make_done_autopilot_state() {
+  local repo_dir="$1"
+  local parent_slug="$2"
+  local content="$3"
+  mkdir -p "$repo_dir/.simple-workflow/backlog/briefs/done/$parent_slug"
+  printf '%s\n' "$content" > "$repo_dir/.simple-workflow/backlog/briefs/done/$parent_slug/autopilot-state.yaml"
+}
+
+make_active_autopilot_state() {
+  local repo_dir="$1"
+  local parent_slug="$2"
+  local content="$3"
+  mkdir -p "$repo_dir/.simple-workflow/backlog/briefs/active/$parent_slug"
+  printf '%s\n' "$content" > "$repo_dir/.simple-workflow/backlog/briefs/active/$parent_slug/autopilot-state.yaml"
+}
+
+make_transcript() {
+  local path="$1"
+  local content="$2"
+  printf '%s\n' "$content" > "$path"
+}
+
+run_guard_hook() {
+  local input="$1"
+  local cwd="${2:-.}"
+  local stdout_file stderr_file
+  stdout_file=$(mktemp); stderr_file=$(mktemp)
+  set +e
+  echo "$input" | (cd "$cwd" && bash "$HOOK") >"$stdout_file" 2>"$stderr_file"
+  local exit_code=$?
+  set -e
+  LAST_EXIT_CODE=$exit_code
+  # shellcheck disable=SC2034
+  LAST_STDOUT=$(cat "$stdout_file")
+  LAST_STDERR=$(cat "$stderr_file")
+  rm -f "$stdout_file" "$stderr_file"
+}
+
+cleanup_session() {
+  rm -f "/tmp/.scout-checkpoint-$1" 2>/dev/null || true
+}
+
+# Shared transcript fixtures -------------------------------------------------
+
+# /scout invocation, then /plan2doc invocation, then plan2doc's ssot-line as
+# the last assistant text turn — no SW-CHECKPOINT emitted yet. This is the
+# "premature end_turn" failure mode the hook is designed to catch.
+TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT='{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"/scout 001-test"}]}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"Skill","input":{"skill":"simple-workflow:scout","args":""}}]}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"Skill","input":{"skill":"simple-workflow:plan2doc","args":"(ticket-dir: .simple-workflow/backlog/active/001-test)"}}]}}
+{"type":"assistant","uuid":"a3","message":{"role":"assistant","content":[{"type":"text","text":"plan2doc: ac-source=ticket.md verbatim=true\n\n**Status**: success\n**Output**: .simple-workflow/backlog/active/001-test/plan.md\n**Summary**: plan written\n**Next Steps**: Run /impl"}]}}'
+
+# Same /scout + /plan2doc invocations, but plan2doc emit is followed by a
+# Phase 3 SW-CHECKPOINT — the prompt-side completed the contract.
+TRANSCRIPT_PLAN2DOC_EMIT_WITH_CHECKPOINT='{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"Skill","input":{"skill":"simple-workflow:scout","args":""}}]}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"Skill","input":{"skill":"simple-workflow:plan2doc","args":""}}]}}
+{"type":"assistant","uuid":"a3","message":{"role":"assistant","content":[{"type":"text","text":"plan2doc: ac-source=ticket.md verbatim=true\n\n**Status**: success"}]}}
+{"type":"assistant","uuid":"a4","message":{"role":"assistant","content":[{"type":"text","text":"## [SW-CHECKPOINT]\nphase: scout\nstatus: completed"}]}}'
+
+# Standalone /audit run (no /scout invocation) — the cross-session staleness
+# guard MUST exit 0 here so unrelated reviews and stale phase-state.yaml
+# from a prior session do not produce false blocks.
+TRANSCRIPT_NO_SCOUT='{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"/audit"}]}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"Skill","input":{"skill":"simple-workflow:audit","args":""}}]}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":[{"type":"text","text":"plan2doc: ac-source=ticket.md verbatim=true (referenced in audit summary, not a fresh emit)"}]}}'
+
+# Same as above but with NO ssot-line in the tail at all.
+TRANSCRIPT_NO_SSOT='{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"/scout"}]}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"Skill","input":{"skill":"simple-workflow:scout","args":""}}]}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":[{"type":"text","text":"Investigating the codebase..."}]}}'
+
+# Canonical phase-state.yaml shapes -----------------------------------------
+
+PHASE_STATE_SCOUT_IN_PROGRESS='version: 1
+size: M
+created: 2026-05-09T00:00:00Z
+current_phase: scout
+last_completed_phase: create_ticket
+overall_status: in-progress
+phases:
+  create_ticket:
+    status: completed
+  scout:
+    status: in-progress
+    started_at: 2026-05-09T00:00:00Z
+    artifacts:
+      investigation: null
+      plan: null
+  impl:
+    status: pending
+  ship:
+    status: pending
+runtime_metrics: []'
+
+PHASE_STATE_SCOUT_COMPLETED='version: 1
+current_phase: impl
+last_completed_phase: scout
+phases:
+  create_ticket:
+    status: completed
+  scout:
+    status: completed
+    completed_at: 2026-05-09T00:00:00Z
+    artifacts:
+      investigation: .simple-workflow/backlog/active/001-test/investigation.md
+      plan: .simple-workflow/backlog/active/001-test/plan.md
+  impl:
+    status: pending
+  ship:
+    status: pending
+runtime_metrics: []'
+
+# Step 2a autopilot-state.yaml fixtures (v8.0.1) ----------------------------
+
+# Canonical "all tickets completed" autopilot-state.yaml — matches the
+# shape /ship writes after the final ticket is shipped.
+AUTOPILOT_STATE_ALL_COMPLETED='version: 1
+slug: test-brief
+created_at: 2026-05-26T00:00:00Z
+tickets:
+  - logical_id: t1
+    ticket_dir: .simple-workflow/backlog/done/test-brief/001-one
+    status: completed
+    steps:
+      create-ticket: completed
+      scout: completed
+      impl: completed
+      ship: completed
+  - logical_id: t2
+    ticket_dir: .simple-workflow/backlog/done/test-brief/002-two
+    status: completed
+    steps:
+      create-ticket: completed
+      scout: completed
+      impl: completed
+      ship: completed'
+
+# Mixed-status autopilot-state.yaml — one completed, one failed. The gate
+# must NOT silent-exit on this shape because the brief is genuinely
+# incomplete (even though /ship moved the dir to briefs/done/).
+AUTOPILOT_STATE_ONE_FAILED='version: 1
+slug: test-brief
+created_at: 2026-05-26T00:00:00Z
+tickets:
+  - logical_id: t1
+    ticket_dir: .simple-workflow/backlog/done/test-brief/001-one
+    status: completed
+    steps:
+      ship: completed
+  - logical_id: t2
+    ticket_dir: .simple-workflow/backlog/done/test-brief/002-two
+    status: failed
+    steps:
+      ship: failed'
+
+# Active autopilot-state.yaml (one ticket still in progress) — used by
+# C10 to assert is_autopilot_context() blocks Step 2a even when a fresh
+# all-completed briefs/done/ state also exists.
+AUTOPILOT_STATE_ACTIVE_IN_PROGRESS='version: 1
+slug: active-brief
+created_at: 2026-05-27T00:00:00Z
+tickets:
+  - logical_id: t1
+    ticket_dir: .simple-workflow/backlog/active/active-brief/001-one
+    status: in-progress
+    steps:
+      scout: in-progress'
+
+# Fixture (C1): missing transcript_path -> exit 0 ---------------------------
+echo "--- C1: short-circuit on missing transcript_path ---"
+TMP=$(mktemp -d)
+SID="scout-cp-c1-$$"
+cleanup_session "$SID"
+# transcript_path empty AND points to nonexistent file
+INPUT=$(jq -n --arg t "" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ -z "$LAST_STDOUT" ]; then
+  echo -e "  ${GREEN}PASS${NC} C1: exit 0, empty stdout"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C1: expected exit 0 + empty stdout"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C2): tail does not contain ssot-line -> exit 0 -------------------
+echo "--- C2: short-circuit on missing ssot-line ---"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_NO_SSOT"
+SID="scout-cp-c2-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ -z "$LAST_STDOUT" ]; then
+  echo -e "  ${GREEN}PASS${NC} C2: exit 0, empty stdout"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C2: expected exit 0 + empty stdout"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C3): ## [SW-CHECKPOINT] visible in tail -> exit 0 + counter cleared
+echo "--- C3: short-circuit on SW-CHECKPOINT present (counter cleared) ---"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_WITH_CHECKPOINT"
+SID="scout-cp-c3-$$"
+# Seed a counter file so we can assert it gets cleaned up.
+echo "2" > "/tmp/.scout-checkpoint-$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ -z "$LAST_STDOUT" ] && [ ! -f "/tmp/.scout-checkpoint-$SID" ]; then
+  echo -e "  ${GREEN}PASS${NC} C3: exit 0, empty stdout, counter cleared"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C3: expected exit 0 + empty stdout + counter removed"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'"
+  echo -e "       Counter still present: $([ -f "/tmp/.scout-checkpoint-$SID" ] && echo yes || echo no)"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C4): no /scout Skill invocation in transcript -> exit 0 ----------
+echo "--- C4: short-circuit on no /scout Skill invocation ---"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_NO_SCOUT"
+SID="scout-cp-c4-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ -z "$LAST_STDOUT" ]; then
+  echo -e "  ${GREEN}PASS${NC} C4: exit 0, empty stdout"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C4: expected exit 0 + empty stdout"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C5): 3-AND met, NO phase-state.yaml -> decision:block (NAC-2) ---
+echo "--- C5: block on 3-AND match without phase-state.yaml (legacy ticket flow) ---"
+TMP=$(mktemp -d)
+# Deliberately do NOT create phase-state.yaml; this is the legacy
+# product_backlog flow that triggered the original failure mode.
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c5-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] && [ "$LAST_EXIT_CODE" -eq 0 ]; then
+  echo -e "  ${GREEN}PASS${NC} C5: emits decision=block, exit 0 (no phase-state.yaml needed)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C5: expected decision=block, exit 0"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'"
+  echo -e "       Stdout: $LAST_STDOUT"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C6): 3-AND met WITH phase-state.yaml in-progress -> decision:block
+echo "--- C6: block on 3-AND match with phase-state.yaml in-progress ---"
+TMP=$(mktemp -d)
+make_phase_state "$TMP" "001-test" "$PHASE_STATE_SCOUT_IN_PROGRESS"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c6-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] && [ "$LAST_EXIT_CODE" -eq 0 ]; then
+  echo -e "  ${GREEN}PASS${NC} C6: emits decision=block, exit 0"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C6: expected decision=block, exit 0"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'"
+  echo -e "       Stdout: $LAST_STDOUT"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C7): phase-state.yaml has scout.status=completed -> exit 0 -------
+echo "--- C7: short-circuit when phase-state.yaml has scout.status=completed ---"
+TMP=$(mktemp -d)
+make_phase_state "$TMP" "001-test" "$PHASE_STATE_SCOUT_COMPLETED"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c7-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ -z "$LAST_STDOUT" ]; then
+  echo -e "  ${GREEN}PASS${NC} C7: exit 0, empty stdout (state machine already advanced)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C7: expected exit 0 + empty stdout"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C8): counter == 3 -> release with [SCOUT-CHECKPOINT-RELEASE] -----
+echo "--- C8: release at counter=3 with [SCOUT-CHECKPOINT-RELEASE] stdout ---"
+TMP=$(mktemp -d)
+# phase-state.yaml in-progress so the counter mtime comparison branch
+# can be exercised. Counter set to 3 to trigger release.
+make_phase_state "$TMP" "001-test" "$PHASE_STATE_SCOUT_IN_PROGRESS"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c8-$$"
+cleanup_session "$SID"
+echo "3" > "/tmp/.scout-checkpoint-$SID"
+# Force counter mtime to be strictly NEWER than state file mtime so the
+# hook's `STATE_FILE -nt COUNTER_FILE` reset branch does NOT fire and
+# BLOCK_COUNT stays at the preset value (3). Mirrors the technique used
+# in test-impl-checkpoint-guard.sh fixture (v).
+touch -r "$TMP/.simple-workflow/backlog/active/001-test/phase-state.yaml" "/tmp/.scout-checkpoint-$SID"
+sleep 1
+touch "/tmp/.scout-checkpoint-$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] \
+   && grep -qF -- '[SCOUT-CHECKPOINT-RELEASE]' <<<"$LAST_STDOUT" \
+   && grep -qF -- 'Resume with: /scout' <<<"$LAST_STDOUT" \
+   && [ ! -f "/tmp/.scout-checkpoint-$SID" ]; then
+  echo -e "  ${GREEN}PASS${NC} C8: release stdout contains [SCOUT-CHECKPOINT-RELEASE] + counter removed"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C8: release stdout missing required tokens"
+  echo -e "       Exit: $LAST_EXIT_CODE"
+  echo -e "       Stdout: $LAST_STDOUT"
+  echo -e "       Stderr: $LAST_STDERR"
+  echo -e "       Counter file present: $([ -f "/tmp/.scout-checkpoint-$SID" ] && echo yes || echo no)"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# ===========================================================================
+# v8.0.1 — Step 2a (autopilot-completion gate) regression cases C9..C14
+# ===========================================================================
+
+# Fixture (C9): fresh done state, all completed -> Step 2a silent exit ------
+echo "--- C9: Step 2a silent-exits on fresh briefs/done/ all-completed state ---"
+TMP=$(mktemp -d)
+make_done_autopilot_state "$TMP" "test-brief" "$AUTOPILOT_STATE_ALL_COMPLETED"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c9-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] \
+   && [ -z "$LAST_STDOUT" ] \
+   && grep -qF -- '[SCOUT-AUTOPILOT-DONE-GATE] silent exit' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} C9: exit 0, empty stdout, gate stderr token visible"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C9: expected exit 0 + empty stdout + gate stderr token"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C10): active autopilot present -> Step 2a yields, 3-AND blocks --
+echo "--- C10: Step 2a yields when an active autopilot exists; 3-AND blocks ---"
+TMP=$(mktemp -d)
+# Done state is all-completed AND fresh, BUT an active autopilot is in
+# progress under briefs/active/ — is_autopilot_context() returns true,
+# so Step 2a does NOT silent-exit. With no phase-state.yaml under
+# .simple-workflow/backlog/active/, Step 3 also passes through and the
+# 3-AND on the transcript tail produces decision=block.
+make_done_autopilot_state "$TMP" "done-brief" "$AUTOPILOT_STATE_ALL_COMPLETED"
+make_active_autopilot_state "$TMP" "active-brief" "$AUTOPILOT_STATE_ACTIVE_IN_PROGRESS"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c10-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] \
+   && [ "$LAST_EXIT_CODE" -eq 0 ] \
+   && ! grep -qF -- '[SCOUT-AUTOPILOT-DONE-GATE] silent exit' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} C10: gate yields to active; decision=block; no gate token"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C10: expected decision=block, no gate stderr token"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'"
+  echo -e "       Stdout: $LAST_STDOUT"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C11): stale done state (year-2020 mtime) -> gate falls through --
+echo "--- C11: stale briefs/done/ state past default TTL falls through to block ---"
+TMP=$(mktemp -d)
+make_done_autopilot_state "$TMP" "test-brief" "$AUTOPILOT_STATE_ALL_COMPLETED"
+# Age the file far past the default 86400s TTL.
+touch -t 202001010000 "$TMP/.simple-workflow/backlog/briefs/done/test-brief/autopilot-state.yaml"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c11-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] \
+   && [ "$LAST_EXIT_CODE" -eq 0 ] \
+   && ! grep -qF -- '[SCOUT-AUTOPILOT-DONE-GATE] silent exit' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} C11: stale done state -> gate falls through; decision=block"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C11: expected decision=block, no gate stderr token"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'"
+  echo -e "       Stdout: $LAST_STDOUT"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C12): SW_SCOUT_CHECKPOINT_MODE=off precedes Step 2a -------------
+echo "--- C12: SW_SCOUT_CHECKPOINT_MODE=off short-circuits before Step 2a ---"
+TMP=$(mktemp -d)
+make_done_autopilot_state "$TMP" "test-brief" "$AUTOPILOT_STATE_ALL_COMPLETED"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c12-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+# Run the hook with the kill switch active. The gate's stderr token must
+# NOT appear (Step 2 wins). Wrapped inline because run_guard_hook does
+# not have an env-passthrough surface.
+stdout_file=$(mktemp); stderr_file=$(mktemp)
+set +e
+echo "$INPUT" | (cd "$TMP" && SW_SCOUT_CHECKPOINT_MODE=off bash "$HOOK") >"$stdout_file" 2>"$stderr_file"
+LAST_EXIT_CODE=$?
+set -e
+LAST_STDOUT=$(cat "$stdout_file"); LAST_STDERR=$(cat "$stderr_file")
+rm -f "$stdout_file" "$stderr_file"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] \
+   && [ -z "$LAST_STDOUT" ] \
+   && ! grep -qF -- '[SCOUT-AUTOPILOT-DONE-GATE]' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} C12: kill-switch wins, no Step 2a stderr token"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C12: expected exit 0 + empty stdout + no gate token"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C13): one ticket failed -> gate fails closed -------------------
+echo "--- C13: one tickets[].status=failed -> gate falls through to block ---"
+TMP=$(mktemp -d)
+make_done_autopilot_state "$TMP" "test-brief" "$AUTOPILOT_STATE_ONE_FAILED"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c13-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] \
+   && [ "$LAST_EXIT_CODE" -eq 0 ] \
+   && ! grep -qF -- '[SCOUT-AUTOPILOT-DONE-GATE] silent exit' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} C13: failed ticket -> gate yields; decision=block"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C13: expected decision=block, no gate stderr token"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'"
+  echo -e "       Stdout: $LAST_STDOUT"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# Fixture (C14): SW_AUTOPILOT_DONE_GATE_TTL_SEC=60 + state aged 120s ------
+echo "--- C14: custom SW_AUTOPILOT_DONE_GATE_TTL_SEC=60 with 120s-old state ---"
+TMP=$(mktemp -d)
+make_done_autopilot_state "$TMP" "test-brief" "$AUTOPILOT_STATE_ALL_COMPLETED"
+# Age the file by 120 seconds. Cross-platform: try GNU date first, BSD
+# date next; both forms yield a stable yyyymmddHHMM[.SS] stamp for touch.
+TS_PAST=""
+if TS_PAST="$(date -u -d "120 seconds ago" "+%Y%m%d%H%M.%S" 2>/dev/null)" && [ -n "$TS_PAST" ]; then
+  :
+elif TS_PAST="$(date -u -v-120S "+%Y%m%d%H%M.%S" 2>/dev/null)" && [ -n "$TS_PAST" ]; then
+  :
+else
+  TS_PAST="202001010000"  # fall back to far-past so the test still rejects
+fi
+touch -t "$TS_PAST" "$TMP/.simple-workflow/backlog/briefs/done/test-brief/autopilot-state.yaml"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-c14-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+stdout_file=$(mktemp); stderr_file=$(mktemp)
+set +e
+echo "$INPUT" | (cd "$TMP" && SW_AUTOPILOT_DONE_GATE_TTL_SEC=60 bash "$HOOK") >"$stdout_file" 2>"$stderr_file"
+LAST_EXIT_CODE=$?
+set -e
+LAST_STDOUT=$(cat "$stdout_file"); LAST_STDERR=$(cat "$stderr_file")
+rm -f "$stdout_file" "$stderr_file"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] \
+   && [ "$LAST_EXIT_CODE" -eq 0 ] \
+   && ! grep -qF -- '[SCOUT-AUTOPILOT-DONE-GATE] silent exit' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} C14: custom TTL=60 + 120s-old state -> gate yields; decision=block"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} C14: expected decision=block, no gate stderr token"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'"
+  echo -e "       Stdout: $LAST_STDOUT"
+  echo -e "       Stderr: $LAST_STDERR"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# ===========================================================================
+# Policy-gate-stop honour gate (SW_AUTOPILOT_POLICY_STOP_HONOR)
+# ===========================================================================
+echo ""
+echo "--- Policy-gate-stop honour gate ---"
+
+# env-capable runner (the default run_guard_hook above does not forward env).
+run_guard_hook_env() {
+  local input="$1"; local cwd="$2"; local env_kv="$3"
+  local stdout_file stderr_file
+  stdout_file=$(mktemp); stderr_file=$(mktemp)
+  set +e
+  if [ -n "$env_kv" ]; then
+    echo "$input" | (cd "$cwd" && env "$env_kv" bash "$HOOK") >"$stdout_file" 2>"$stderr_file"
+  else
+    echo "$input" | (cd "$cwd" && bash "$HOOK") >"$stdout_file" 2>"$stderr_file"
+  fi
+  LAST_EXIT_CODE=$?
+  set -e
+  LAST_STDOUT=$(cat "$stdout_file"); LAST_STDERR=$(cat "$stderr_file")
+  rm -f "$stdout_file" "$stderr_file"
+}
+
+# Transcript whose LAST assistant turn carries the plan2doc ssot-line (so the
+# 3-AND would normally block) AND the policy_gate_stop marker in the same
+# text block.
+TRANSCRIPT_PLAN2DOC_PLUS_POLICY_STOP='{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"/scout 001-test"}]}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"Skill","input":{"skill":"simple-workflow:scout","args":""}}]}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"Skill","input":{"skill":"simple-workflow:plan2doc","args":""}}]}}
+{"type":"assistant","uuid":"a3","message":{"role":"assistant","content":[{"type":"text","text":"plan2doc: ac-source=ticket.md verbatim=true\n[AUTOPILOT-POLICY] gate=unexpected_error action=stop reason=state_recovery_hard_stop"}]}}'
+
+# (P-i): honour on → 3-AND met but marker present → NO block, exit 0.
+echo "--- (P-i): honour on → 3-AND met + marker → no block ---"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_PLUS_POLICY_STOP"
+SID="scout-cp-pgs-i-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook_env "$INPUT" "$TMP" "SW_AUTOPILOT_POLICY_STOP_HONOR=on"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ "$DECISION" != "block" ] \
+   && grep -qF -- '[POLICY-GATE-STOP]' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} (P-i): honour → exit 0, no block, [POLICY-GATE-STOP] stderr"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (P-i): expected exit 0 + no block"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'  Stderr: ${LAST_STDERR:0:160}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (P-ii): regression — same 3-AND but NO marker → still blocks (honour on).
+echo "--- (P-ii): no marker → still blocks ---"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-pgs-ii-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook_env "$INPUT" "$TMP" "SW_AUTOPILOT_POLICY_STOP_HONOR=on"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ]; then
+  echo -e "  ${GREEN}PASS${NC} (P-ii): no marker → decision=block (unchanged)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (P-ii): expected decision=block"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (P-iii): kill switch off → ignore marker → block.
+echo "--- (P-iii): off → block despite marker ---"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_PLUS_POLICY_STOP"
+SID="scout-cp-pgs-iii-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook_env "$INPUT" "$TMP" "SW_AUTOPILOT_POLICY_STOP_HONOR=off"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ]; then
+  echo -e "  ${GREEN}PASS${NC} (P-iii): off → decision=block (marker ignored)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (P-iii): expected decision=block"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (P-iv): metric-only → block + [POLICY-GATE-STOP] would-honour stderr.
+echo "--- (P-iv): metric-only → block + stderr ---"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_PLUS_POLICY_STOP"
+SID="scout-cp-pgs-iv-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook_env "$INPUT" "$TMP" "SW_AUTOPILOT_POLICY_STOP_HONOR=metric-only"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] && grep -qF -- '[POLICY-GATE-STOP]' <<<"$LAST_STDERR" \
+   && grep -qiF -- 'would honour' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} (P-iv): metric-only → block + would-honour stderr"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (P-iv): expected block + would-honour stderr"
+  echo -e "       Decision: '$DECISION'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (P-v): unknown value → fail-closed to off → block.
+echo "--- (P-v): unknown value → fail-closed (block) ---"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_PLUS_POLICY_STOP"
+SID="scout-cp-pgs-v-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s}')
+run_guard_hook_env "$INPUT" "$TMP" "SW_AUTOPILOT_POLICY_STOP_HONOR=garbage-value"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ]; then
+  echo -e "  ${GREEN}PASS${NC} (P-v): unknown → decision=block (fail-closed)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (P-v): expected decision=block"
+  echo -e "       Decision: '$DECISION'"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# ===========================================================================
+# T-005 — parallel-mode dual-event branch (Stop / SubagentStop)
+# ===========================================================================
+echo ""
+echo "--- T-005 parallel-mode dual-event branch ---"
+
+# Write an autopilot-state.yaml under briefs/active/<slug>/ carrying an
+# optional parallel_mode: scalar (and optionally main_checkout_root). Used to
+# drive resolve_parallel_mode + the main_checkout_root preference. Symmetric
+# to the helper in tests/test-impl-checkpoint-guard.sh (peer uniformity).
+make_parallel_autopilot_state() {
+  local repo_dir="$1"
+  local parent_slug="$2"
+  local parallel_mode="$3"
+  local main_checkout_root="${4:-}"
+  mkdir -p "$repo_dir/.simple-workflow/backlog/briefs/active/$parent_slug"
+  {
+    printf 'version: 1\n'
+    printf 'slug: %s\n' "$parent_slug"
+    printf 'parallel_mode: %s\n' "$parallel_mode"
+    [ -n "$main_checkout_root" ] && printf 'main_checkout_root: %s\n' "$main_checkout_root"
+    printf 'tickets:\n'
+    printf '  - logical_id: t1\n'
+    printf '    ticket_dir: 001-test\n'
+    printf '    status: in_progress\n'
+    printf '    steps:\n'
+    printf '      scout: in_progress\n'
+  } > "$repo_dir/.simple-workflow/backlog/briefs/active/$parent_slug/autopilot-state.yaml"
+}
+
+# Executor transcript: an ac-evaluator subagent whose tail has NO plan2doc
+# ssot-line and NO Skill(simple-workflow:scout) invocation — the existing
+# Step 6/7 signature gate must silent-exit on it.
+TRANSCRIPT_AC_EVALUATOR='{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"evaluate ACs"}]}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"**Status**: PASS\n**Summary**: all ACs pass"}]}}'
+
+# (T-PAR-1): SubagentStop + parallel=on + executor transcript (3-AND) → block.
+echo "--- (T-PAR-1): SubagentStop + parallel=on + 3-AND → block ---"
+TMP=$(mktemp -d)
+make_parallel_autopilot_state "$TMP" "par-brief" "on"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-tpar1-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" \
+  '{transcript_path: $t, session_id: $s, hook_event_name: "SubagentStop"}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] && [ "$LAST_EXIT_CODE" -eq 0 ]; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-1): SubagentStop enforces on executor transcript → decision=block"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-1): expected decision=block, exit 0"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (T-PAR-1b): SubagentStop + parallel=on + agent_transcript_path → the executor's
+# OWN transcript (agent_transcript_path) is scanned, NOT the parent session's
+# transcript_path (per the hook contract the orchestrator's). The parent transcript
+# is an unrelated ac-evaluator transcript that would silent-exit; the executor
+# transcript carries the 3-AND → decision=block proves the preference.
+echo "--- (T-PAR-1b): SubagentStop + agent_transcript_path preferred over transcript_path ---"
+TMP=$(mktemp -d)
+make_parallel_autopilot_state "$TMP" "par-brief" "on"
+make_transcript "$TMP/parent-transcript.jsonl" "$TRANSCRIPT_AC_EVALUATOR"
+make_transcript "$TMP/executor-transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-tpar1b-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/parent-transcript.jsonl" --arg a "$TMP/executor-transcript.jsonl" --arg s "$SID" \
+  '{transcript_path: $t, agent_transcript_path: $a, agent_type: "ticket-executor", session_id: $s, hook_event_name: "SubagentStop"}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] && [ "$LAST_EXIT_CODE" -eq 0 ]; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-1b): SubagentStop scans agent_transcript_path (executor) → decision=block"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-1b): expected decision=block from the executor transcript, exit 0"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (BG-STAND-DOWN): main Stop with a background subagent in flight -> stand down
+# (exit 0, no block) even though the fixture would otherwise block; a
+# SubagentStop with the same (parent-scoped) list still enforces.
+echo "--- (BG-STAND-DOWN): background subagent in flight -> main Stop stands down; SubagentStop still enforces ---"
+TMP=$(mktemp -d)
+make_phase_state "$TMP" "001-test" "$PHASE_STATE_SCOUT_IN_PROGRESS"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-bg-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s, hook_event_name: "Stop", background_tasks: [{id: "task-1", type: "subagent", status: "running", agent_type: "ticket-executor"}]}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ "$DECISION" != "block" ] && grep -qF 'standing down: 1 background agent task' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} (BG-STAND-DOWN): main Stop + background subagent -> exit 0, no block"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (BG-STAND-DOWN): expected exit 0 + no block; exit=$LAST_EXIT_CODE decision='$DECISION' stderr='${LAST_STDERR:0:160}'"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (REL-NAT): four consecutive Stop ticks with NO state-file progress → three
+# blocks then a natural release on the 4th tick (see the impl guard's REL-NAT:
+# the hook's own runtime_metrics append must not reset its release counter).
+echo "--- (REL-NAT): 4 consecutive ticks → block, block, block, release ---"
+TMP=$(mktemp -d)
+make_phase_state "$TMP" "001-test" "$PHASE_STATE_SCOUT_IN_PROGRESS"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-relnat-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" '{transcript_path: $t, session_id: $s, hook_event_name: "Stop"}')
+REL_SEQ=""
+for _tick in 1 2 3 4; do
+  run_guard_hook "$INPUT" "$TMP"
+  _dec=$(echo "$LAST_STDOUT" | jq -r '.decision // "none"' 2>/dev/null || echo "none")
+  if grep -qF -- '[SCOUT-CHECKPOINT-RELEASE]' <<<"$LAST_STDOUT"; then _dec="release"; fi
+  REL_SEQ="$REL_SEQ$_dec,"
+done
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$REL_SEQ" = "block,block,block,release," ]; then
+  echo -e "  ${GREEN}PASS${NC} (REL-NAT): sequence block,block,block,release (own metrics write no longer resets the counter)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (REL-NAT): expected block,block,block,release — got: $REL_SEQ"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (T-PAR-2): Stop + parallel=on → stand down (exit 0, [SCOUT-CHECKPOINT] log).
+echo "--- (T-PAR-2): main Stop + parallel=on → stand down ---"
+TMP=$(mktemp -d)
+make_parallel_autopilot_state "$TMP" "par-brief" "on"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-tpar2-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" \
+  '{transcript_path: $t, session_id: $s, hook_event_name: "Stop"}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ "$DECISION" != "block" ] \
+   && grep -qF -- '[SCOUT-CHECKPOINT] parallel stand-down' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-2): main Stop stands down → exit 0, no block, stand-down log"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-2): expected exit 0 + no block + stand-down log"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (T-PAR-3): serial (parallel=off) SubagentStop + unrelated ac-evaluator
+# transcript → silent-exit at the existing signature gate.
+echo "--- (T-PAR-3): serial SubagentStop + unrelated ac-evaluator → silent exit ---"
+TMP=$(mktemp -d)
+make_parallel_autopilot_state "$TMP" "par-brief" "off"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_AC_EVALUATOR"
+SID="scout-cp-tpar3-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" \
+  '{transcript_path: $t, session_id: $s, hook_event_name: "SubagentStop"}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ -z "$LAST_STDOUT" ] \
+   && ! grep -qF -- '[SCOUT-CHECKPOINT] parallel stand-down' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-3): serial SubagentStop → exit 0, empty stdout, no parallel log"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-3): expected exit 0 + empty stdout + no parallel log"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (T-PAR-4): non-autopilot SubagentStop → exit 0, no block (parallel resolves
+# off because there is no autopilot-state.yaml; the signature gate exits 0).
+echo "--- (T-PAR-4): non-autopilot SubagentStop → exit 0 ---"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.simple-workflow/backlog/active"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_AC_EVALUATOR"
+SID="scout-cp-tpar4-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" \
+  '{transcript_path: $t, session_id: $s, hook_event_name: "SubagentStop"}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ -z "$LAST_STDOUT" ]; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-4): non-autopilot SubagentStop → exit 0, empty stdout"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-4): expected exit 0 + empty stdout"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (T-PAR-5): missing hook_event_name + parallel=on → treated as Stop → stand down.
+echo "--- (T-PAR-5): missing hook_event_name + parallel=on → treated as Stop (stand down) ---"
+TMP=$(mktemp -d)
+make_parallel_autopilot_state "$TMP" "par-brief" "on"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-tpar5-$$"
+cleanup_session "$SID"
+# No hook_event_name field in the payload.
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" \
+  '{transcript_path: $t, session_id: $s}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$LAST_EXIT_CODE" -eq 0 ] && [ "$DECISION" != "block" ] \
+   && grep -qF -- '[SCOUT-CHECKPOINT] parallel stand-down' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-5): missing event treated as Stop → stand down"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-5): expected exit 0 + no block + stand-down log"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (T-PAR-6): parallel=off main Stop → existing behaviour unchanged (block).
+echo "--- (T-PAR-6): parallel=off main Stop → existing behaviour (block) ---"
+TMP=$(mktemp -d)
+make_parallel_autopilot_state "$TMP" "par-brief" "off"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-tpar6-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" \
+  '{transcript_path: $t, session_id: $s, hook_event_name: "Stop"}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] && [ "$LAST_EXIT_CODE" -eq 0 ] \
+   && ! grep -qF -- '[SCOUT-CHECKPOINT] parallel' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-6): parallel=off main Stop → decision=block, no parallel log"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-6): expected decision=block, no parallel stderr"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (T-PAR-7): metric-only main Stop → log "would stand down" + fall through (block).
+echo "--- (T-PAR-7): metric-only main Stop → log + fall through (block) ---"
+TMP=$(mktemp -d)
+make_parallel_autopilot_state "$TMP" "par-brief" "metric-only"
+make_transcript "$TMP/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-tpar7-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$TMP/transcript.jsonl" --arg s "$SID" \
+  '{transcript_path: $t, session_id: $s, hook_event_name: "Stop"}')
+run_guard_hook "$INPUT" "$TMP"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] && [ "$LAST_EXIT_CODE" -eq 0 ] \
+   && grep -qF -- '[SCOUT-CHECKPOINT] parallel stand-down (metric-only)' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-7): metric-only logs would-stand-down + falls through → block"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-7): expected block + metric-only stand-down log"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$TMP"
+
+# (T-PAR-8): SubagentStop in worktree reads main_checkout_root preference and
+# still enforces (scout's phase-state is optional, so the 3-AND blocks even
+# when the worktree carries no local phase-state.yaml). Symmetric to impl's
+# worktree case; for scout the main_checkout_root preference only sharpens the
+# Step 3 short-circuit, never gates enforcement.
+echo "--- (T-PAR-8): SubagentStop in worktree (main_checkout_root) → block ---"
+MAIN=$(mktemp -d)
+WT=$(mktemp -d)
+mkdir -p "$WT/.simple-workflow/backlog/active"
+make_parallel_autopilot_state "$WT" "par-brief" "on" "$MAIN"
+make_transcript "$WT/transcript.jsonl" "$TRANSCRIPT_PLAN2DOC_EMIT_NO_CHECKPOINT"
+SID="scout-cp-tpar8-$$"
+cleanup_session "$SID"
+INPUT=$(jq -n --arg t "$WT/transcript.jsonl" --arg s "$SID" \
+  '{transcript_path: $t, session_id: $s, hook_event_name: "SubagentStop"}')
+run_guard_hook "$INPUT" "$WT"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+DECISION=$(echo "$LAST_STDOUT" | jq -r '.decision // ""' 2>/dev/null || echo "")
+if [ "$DECISION" = "block" ] && [ "$LAST_EXIT_CODE" -eq 0 ]; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-8): worktree SubagentStop with main_checkout_root → block"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-8): expected decision=block"
+  echo -e "       Exit: $LAST_EXIT_CODE  Decision: '$DECISION'  Stderr: ${LAST_STDERR:0:200}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID"
+rm -rf "$MAIN" "$WT"
+
+# --- (T-PAR-9, dogfood63 AC-8 owed): SubagentStop in a worktree whose .simple-workflow is a SYMLINK
+# to the main checkout; the orchestrator-written main_checkout_root resolves the scout-completed
+# phase-state at the ABSOLUTE main path, the Step-3 short-circuit fires, and the resolution emits its
+# observability marker (subagent transcripts do not capture hook stderr, so the marker is the only
+# way to verify the resolution ran -- this closes the dogfood63 AC-8 owed item). -------------------
+echo "--- (T-PAR-9): SubagentStop worktree-via-symlink, main_checkout_root resolves scout-completed -> silent exit + marker ---"
+MAIN9=$(mktemp -d); WT9=$(mktemp -d)
+SLUG9="ac8-brief"; TICKET9="001-ac8"
+make_parallel_autopilot_state "$MAIN9" "$SLUG9" "on" "$MAIN9"
+mkdir -p "$MAIN9/.simple-workflow/backlog/active/$SLUG9/$TICKET9"
+printf 'phases:\n  scout:\n    status: completed\n' > "$MAIN9/.simple-workflow/backlog/active/$SLUG9/$TICKET9/phase-state.yaml"
+ln -s "$MAIN9/.simple-workflow" "$WT9/.simple-workflow"   # FIX-1 executor self-creates this symlink
+SID9="scout-cp-tpar9-$$"; cleanup_session "$SID9"
+INPUT=$(jq -n --arg s "$SID9" '{transcript_path: "", session_id: $s, hook_event_name: "SubagentStop"}')
+run_guard_hook "$INPUT" "$WT9"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if grep -q -- "main_checkout_root resolution: root=$MAIN9" <<<"$LAST_STDERR" \
+   && [ "$LAST_EXIT_CODE" -eq 0 ] && [ -z "$LAST_STDOUT" ]; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-9): main_checkout_root-via-symlink resolution marker fired + Step-3 short-circuit (silent exit)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-9): expected marker 'root=$MAIN9' + exit 0 + empty stdout"
+  echo -e "       Exit: $LAST_EXIT_CODE  Stdout: '$LAST_STDOUT'  Stderr: ${LAST_STDERR:0:300}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+# Non-vacuity control: the SAME setup WITHOUT a main_checkout_root in the state -> the resolution
+# block is skipped and its marker MUST NOT appear (the marker is tied specifically to the
+# main_checkout_root resolution, not to any short-circuit).
+MAINC=$(mktemp -d); WTC=$(mktemp -d); SLUGC="ac8-noroot"
+make_parallel_autopilot_state "$MAINC" "$SLUGC" "on" ""
+mkdir -p "$MAINC/.simple-workflow/backlog/active/$SLUGC/001-c"
+printf 'phases:\n  scout:\n    status: completed\n' > "$MAINC/.simple-workflow/backlog/active/$SLUGC/001-c/phase-state.yaml"
+ln -s "$MAINC/.simple-workflow" "$WTC/.simple-workflow"
+SIDC="scout-cp-tpar9c-$$"; cleanup_session "$SIDC"
+INPUTC=$(jq -n --arg s "$SIDC" '{transcript_path: "", session_id: $s, hook_event_name: "SubagentStop"}')
+run_guard_hook "$INPUTC" "$WTC"
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if ! grep -q -- 'main_checkout_root resolution' <<<"$LAST_STDERR"; then
+  echo -e "  ${GREEN}PASS${NC} (T-PAR-9 control): no main_checkout_root in state -> resolution marker absent (non-vacuous)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} (T-PAR-9 control): marker fired despite empty main_checkout_root"
+  echo -e "       Stderr: ${LAST_STDERR:0:300}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+cleanup_session "$SID9"; cleanup_session "$SIDC"
+rm -rf "$MAIN9" "$WT9" "$MAINC" "$WTC"
+
+echo ""
+print_summary

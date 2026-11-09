@@ -1,0 +1,517 @@
+// Standalone plain-Node unit test for the eval-panel merge pure-function.
+//
+// Run: node tests/test-eval-panel-merge.mjs   (exit 0 on success, 1 on failure)
+//
+// This test has NO access to the Workflow sandbox globals (agent/parallel/log/
+// phase/args), so it pastes a VERBATIM copy of mergeAcVerdicts (and the two
+// severity-ladder helpers it depends on) below.
+//
+// MIRROR of skills/impl/workflows/eval-panel.mjs - keep in sync. Any edit to
+// mergeAcVerdicts (or VERDICT_RANK / statusRank) in the product Workflow MUST be
+// applied identically here, and vice versa.
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+// ----- BEGIN VERBATIM MIRROR (from skills/impl/workflows/eval-panel.mjs) -----
+
+// --- Severity ladder helpers (shared by both merge modes) ---
+// Ladder: FAIL_CRITICAL > FAIL > PASS_WITH_CAVEATS > PASS.
+const VERDICT_RANK = {
+  PASS: 0,
+  PASS_WITH_CAVEATS: 1,
+  FAIL: 2,
+  CRITICAL: 3, // per-AC critical verdict
+  FAIL_CRITICAL: 3, // round-level critical status
+};
+
+function statusRank(s) {
+  return VERDICT_RANK[s] === undefined ? 0 : VERDICT_RANK[s];
+}
+
+function mergeAcVerdicts(verifiers, { refuteMerge } = {}) {
+  const mode = refuteMerge === "off" ? "majority" : "refute";
+
+  // 1. Drop invalid envelopes (null, no usable acs array, or a non-terminal
+  //    IN_PROGRESS status — an unfinished verifier is not an independent verdict
+  //    and must not count toward the quorum).
+  const valid = (Array.isArray(verifiers) ? verifiers : []).filter(
+    (v) => v && Array.isArray(v.acs) && String(v.status) !== "IN_PROGRESS",
+  );
+
+  // 2. Quorum: fewer than two independent envelopes is FAIL_CRITICAL.
+  if (valid.length < 2) {
+    return {
+      status: "FAIL_CRITICAL",
+      acs: [],
+      issues: [
+        `[quorum] only ${valid.length} valid verifier envelope(s); >=2 required for independent verification`,
+      ],
+      mergeMode: mode,
+    };
+  }
+
+  // 3. Index each valid verifier's per-AC verdicts by AC id.
+  //    Build the ordered set of AC ids in first-seen order across verifiers.
+  const order = [];
+  const seen = new Set();
+  const byVerifier = valid.map((v) => {
+    const m = new Map();
+    for (const ac of v.acs) {
+      if (!ac || ac.id === undefined || ac.id === null) continue;
+      const id = String(ac.id);
+      m.set(id, ac);
+      if (!seen.has(id)) {
+        seen.add(id);
+        order.push(id);
+      }
+    }
+    return m;
+  });
+
+  // 4. Merge each AC.
+  const mergedAcs = [];
+  for (const id of order) {
+    // Verdicts actually rendered on this AC (silence is excluded).
+    const rendered = byVerifier
+      .map((m) => m.get(id))
+      .filter((ac) => ac && ac.verdict !== undefined && ac.verdict !== null);
+
+    // Carry a representative AC object forward for its metadata fields, but the
+    // merged verdict is recomputed below.
+    const repr = rendered[0] || { id };
+
+    const verdicts = rendered.map((ac) => String(ac.verdict));
+
+    // 4a. CRITICAL is not voted away (both modes).
+    if (verdicts.includes("CRITICAL")) {
+      mergedAcs.push({ ...repr, id, verdict: "CRITICAL" });
+      continue;
+    }
+
+    const failers = rendered.filter((ac) => String(ac.verdict) === "FAIL");
+    const refuters = rendered.filter((ac) => {
+      const vd = String(ac.verdict);
+      return vd === "PASS" || vd === "PASS_WITH_CAVEATS";
+    });
+
+    let verdict;
+    if (failers.length === 0) {
+      // No FAIL at all: PASS, upgraded to PASS_WITH_CAVEATS only when >=2
+      // valid verifiers rendered PASS_WITH_CAVEATS.
+      const caveats = rendered.filter(
+        (ac) => String(ac.verdict) === "PASS_WITH_CAVEATS",
+      );
+      verdict = caveats.length >= 2 ? "PASS_WITH_CAVEATS" : "PASS";
+    } else if (mode === "majority") {
+      // Majority-merge: FAIL only with >=2 non-critical failers; lone FAIL
+      // demoted to PASS.
+      verdict = failers.length >= 2 ? "FAIL" : "PASS";
+    } else {
+      // Refute-merge: a non-critical FAIL is merged FAIL UNLESS every OTHER
+      // valid verifier refutes it (affirmative non-FAIL on the SAME AC).
+      // Two independent FAILs corroborate - neither refutes the other - so a
+      // refutation can clear the failure ONLY when there is exactly ONE failer
+      // and every other valid verifier rendered an affirmative non-FAIL on this
+      // AC (silence is NOT refutation, so the refuter count must cover every
+      // non-failing valid verifier: valid - 1).
+      const everyOtherRefutes =
+        failers.length === 1 && refuters.length === valid.length - 1;
+      verdict = everyOtherRefutes ? "PASS" : "FAIL";
+    }
+
+    mergedAcs.push({ ...repr, id, verdict });
+  }
+
+  // 5. Overall status = worst merged per-AC verdict on the ladder. A
+  //    verifier-level FAIL_CRITICAL (a critical finding not tied to one AC id)
+  //    is CRITICAL-not-voted-away exactly like a per-AC CRITICAL.
+  let worst = "PASS";
+  for (const ac of mergedAcs) {
+    const v = String(ac.verdict);
+    if (statusRank(v) > statusRank(worst)) worst = v;
+  }
+  if (valid.some((v) => String(v.status) === "FAIL_CRITICAL")) worst = "FAIL_CRITICAL";
+  // Normalize per-AC CRITICAL up to the round-level FAIL_CRITICAL status.
+  const status = worst === "CRITICAL" ? "FAIL_CRITICAL" : worst;
+
+  // 6. Concatenate issues across valid verifiers, tagged by source verifier.
+  const issues = [];
+  valid.forEach((v, i) => {
+    if (!Array.isArray(v.issues)) return;
+    for (const issue of v.issues) {
+      if (typeof issue === "string") {
+        issues.push(`[v${i + 1}] ${issue}`);
+      } else if (issue && typeof issue === "object") {
+        issues.push({ verifier: `v${i + 1}`, ...issue });
+      }
+    }
+  });
+
+  return { status, acs: mergedAcs, issues, mergeMode: mode };
+}
+
+// ----- END VERBATIM MIRROR -----
+
+// --- Tiny assert helper + table-driven runner ---
+
+let passes = 0;
+let failures = 0;
+
+function assertEq(actual, expected, label) {
+  if (actual === expected) {
+    passes += 1;
+  } else {
+    failures += 1;
+    console.error(
+      `  FAIL: ${label}\n    expected: ${JSON.stringify(expected)}\n    actual:   ${JSON.stringify(actual)}`,
+    );
+  }
+}
+
+// Convenience: build a verifier envelope from a list of [acId, verdict] pairs.
+function v(...pairs) {
+  return { status: "PASS", acs: pairs.map(([id, verdict]) => ({ id, verdict })), issues: [] };
+}
+
+// Pull the merged verdict for a given AC id out of a merge result.
+function verdictOf(result, id) {
+  const ac = result.acs.find((x) => x.id === id);
+  return ac ? ac.verdict : undefined;
+}
+
+// Each case: name, verifiers, opts, and a check(result) callback.
+const cases = [
+  {
+    name: "1. one CRITICAL anywhere => CRITICAL (refute mode)",
+    verifiers: [
+      v(["AC-1", "PASS"]),
+      v(["AC-1", "CRITICAL"]),
+      v(["AC-1", "PASS"]),
+    ],
+    opts: {},
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "CRITICAL", "AC-1 verdict");
+      assertEq(r.status, "FAIL_CRITICAL", "round status");
+    },
+  },
+  {
+    name: "1b. one CRITICAL anywhere => CRITICAL (majority mode too)",
+    verifiers: [
+      v(["AC-1", "CRITICAL"]),
+      v(["AC-1", "PASS"]),
+      v(["AC-1", "PASS"]),
+    ],
+    opts: { refuteMerge: "off" },
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "CRITICAL", "AC-1 verdict");
+      assertEq(r.status, "FAIL_CRITICAL", "round status");
+    },
+  },
+  {
+    // The task's case (2): a lone non-critical FAIL that SURVIVES under
+    // refute-merge but is DEMOTED under majority-merge. Per the authority
+    // (ac-evaluator-orchestration.md L164-175) two affirmative refuters would
+    // CLEAR the failure to PASS even under refute-merge, so the scenario that
+    // genuinely diverges between the two modes is a lone FAIL with one
+    // affirmative refuter and one SILENT sibling: silence is not refutation, so
+    // not-every-other-refutes => survives FAIL under refute; only one failer =>
+    // demoted to PASS under majority.
+    name: "2a. lone non-critical FAIL, one refuter + one SILENT sibling => survives as FAIL under refute-merge",
+    verifiers: [
+      v(["AC-1", "FAIL"]),
+      v(["AC-1", "PASS"]),
+      v(["AC-2", "PASS"]), // silent on AC-1
+    ],
+    opts: {}, // refute (default)
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "FAIL", "AC-1 survives as FAIL (silence != refutation)");
+      assertEq(r.status, "FAIL", "round status");
+    },
+  },
+  {
+    name: "2b. same lone non-critical FAIL => DEMOTED to PASS under majority-merge (only 1 failer)",
+    verifiers: [
+      v(["AC-1", "FAIL"]),
+      v(["AC-1", "PASS"]),
+      v(["AC-2", "PASS"]), // silent on AC-1
+    ],
+    opts: { refuteMerge: "off" },
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "PASS", "AC-1 demoted to PASS (<2 failers)");
+    },
+  },
+  {
+    // Corroboration of a refutation: a lone FAIL that EVERY other valid verifier
+    // affirmatively refutes IS cleared to PASS under refute-merge (authority
+    // L167-168: "A FAIL that every other valid verifier explicitly refutes is
+    // merged PASS"). Same PASS under majority. Pinned so a future code change
+    // that stops clearing fully-refuted failures is caught.
+    name: "2c. lone FAIL, BOTH others affirmatively refute (PASS) => cleared to PASS (both modes)",
+    verifiers: [
+      v(["AC-1", "FAIL"]),
+      v(["AC-1", "PASS"]),
+      v(["AC-1", "PASS"]),
+    ],
+    opts: {},
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "PASS", "AC-1 cleared (every other refutes), refute-merge");
+      const maj = mergeAcVerdicts(
+        [v(["AC-1", "FAIL"]), v(["AC-1", "PASS"]), v(["AC-1", "PASS"])],
+        { refuteMerge: "off" },
+      );
+      assertEq(verdictOf(maj, "AC-1"), "PASS", "AC-1 PASS under majority too");
+    },
+  },
+  {
+    name: "3a. lone FAIL but a sibling is SILENT (no verdict) => NOT refuted, survives FAIL (refute)",
+    verifiers: [
+      v(["AC-1", "FAIL"]),
+      v(["AC-1", "PASS"]),
+      v(["AC-2", "PASS"]), // silent on AC-1
+    ],
+    opts: {},
+    check: (r) => {
+      // Only one refuter (v2); v3 is silent on AC-1, so silence != refutation.
+      assertEq(verdictOf(r, "AC-1"), "FAIL", "AC-1 survives (silence not refutation)");
+    },
+  },
+  {
+    name: "3b. two FAIL, one also FAIL => FAIL under refute-merge",
+    verifiers: [
+      v(["AC-1", "FAIL"]),
+      v(["AC-1", "FAIL"]),
+      v(["AC-1", "PASS"]),
+    ],
+    opts: {},
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "FAIL", "AC-1 FAIL (not every other refutes)");
+      assertEq(r.status, "FAIL", "round status");
+    },
+  },
+  {
+    name: "3c. two FAIL => FAIL under majority-merge as well",
+    verifiers: [
+      v(["AC-1", "FAIL"]),
+      v(["AC-1", "FAIL"]),
+      v(["AC-1", "PASS"]),
+    ],
+    opts: { refuteMerge: "off" },
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "FAIL", "AC-1 FAIL (>=2 failers)");
+      assertEq(r.status, "FAIL", "round status");
+    },
+  },
+  {
+    name: "4a. quorum < 2 (only 1 valid envelope, others null) => FAIL_CRITICAL",
+    verifiers: [v(["AC-1", "PASS"]), null, null],
+    opts: {},
+    check: (r) => {
+      assertEq(r.status, "FAIL_CRITICAL", "round status");
+      assertEq(r.acs.length, 0, "no merged acs on quorum failure");
+    },
+  },
+  {
+    name: "4b. quorum < 2 (one valid + one malformed envelope) => FAIL_CRITICAL",
+    verifiers: [v(["AC-1", "PASS"]), { status: "PASS" /* no acs */ }, null],
+    opts: { refuteMerge: "off" },
+    check: (r) => {
+      assertEq(r.status, "FAIL_CRITICAL", "round status (majority mode quorum)");
+    },
+  },
+  {
+    name: "5. all PASS => PASS",
+    verifiers: [
+      v(["AC-1", "PASS"], ["AC-2", "PASS"]),
+      v(["AC-1", "PASS"], ["AC-2", "PASS"]),
+      v(["AC-1", "PASS"], ["AC-2", "PASS"]),
+    ],
+    opts: {},
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "PASS", "AC-1 PASS");
+      assertEq(verdictOf(r, "AC-2"), "PASS", "AC-2 PASS");
+      assertEq(r.status, "PASS", "round status");
+    },
+  },
+  {
+    name: "6. >=2 PASS_WITH_CAVEATS => merged PASS_WITH_CAVEATS",
+    verifiers: [
+      v(["AC-1", "PASS_WITH_CAVEATS"]),
+      v(["AC-1", "PASS_WITH_CAVEATS"]),
+      v(["AC-1", "PASS"]),
+    ],
+    opts: {},
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "PASS_WITH_CAVEATS", "AC-1 caveats");
+      assertEq(r.status, "PASS_WITH_CAVEATS", "round status");
+    },
+  },
+  {
+    name: "7. an IN_PROGRESS envelope does not count toward the quorum",
+    verifiers: [
+      { status: "IN_PROGRESS", acs: [{ id: "AC-1", verdict: "PASS" }] },
+      v(["AC-1", "PASS"]),
+    ],
+    opts: {},
+    check: (r) => {
+      assertEq(r.status, "FAIL_CRITICAL", "one terminal envelope -> quorum failure");
+    },
+  },
+  {
+    name: "7b. verifier-level FAIL_CRITICAL is not voted away",
+    verifiers: [
+      { status: "FAIL_CRITICAL", acs: [{ id: "AC-1", verdict: "PASS" }], issues: ["secret committed"] },
+      v(["AC-1", "PASS"]),
+      v(["AC-1", "PASS"]),
+    ],
+    opts: {},
+    check: (r) => {
+      assertEq(r.status, "FAIL_CRITICAL", "envelope-level FAIL_CRITICAL wins the ladder");
+      assertEq(verdictOf(r, "AC-1"), "PASS", "per-AC verdicts unchanged");
+    },
+  },
+  {
+    name: "6b. lone PASS_WITH_CAVEATS does not downgrade a majority PASS",
+    verifiers: [
+      v(["AC-1", "PASS_WITH_CAVEATS"]),
+      v(["AC-1", "PASS"]),
+      v(["AC-1", "PASS"]),
+    ],
+    opts: {},
+    check: (r) => {
+      assertEq(verdictOf(r, "AC-1"), "PASS", "AC-1 stays PASS (single caveat)");
+    },
+  },
+];
+
+console.log("test-eval-panel-merge: running merge unit cases\n");
+for (const c of cases) {
+  console.log(`- ${c.name}`);
+  c.check(mergeAcVerdicts(c.verifiers, c.opts));
+}
+
+// ----- Product-script contract (the committed Workflow file itself) -----
+// (1) The script MUST hand its result back with a top-level `return` — the
+//     Workflow runtime returns only what the wrapped async body returns; a bare
+//     trailing expression yields NO result to /impl Step 16.
+// (2) It MUST parse as an async function body with the sandbox globals in scope
+//     (`node --check` cannot be the gate: a top-level `return` is invalid in a
+//     plain ES module, and the sandbox is not a module).
+console.log("\n- product-script contract: skills/impl/workflows/eval-panel.mjs");
+const productPath = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "skills",
+  "impl",
+  "workflows",
+  "eval-panel.mjs",
+);
+const productSrc = readFileSync(productPath, "utf8");
+assertEq(
+  /\breturn\s+merged\s*;?\s*$/.test(productSrc.trimEnd()),
+  true,
+  "eval-panel.mjs ends with a top-level `return merged`",
+);
+let parseError = null;
+try {
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const body = productSrc.replace(/^\s*export\s+const\s+meta\b/m, "const meta");
+  new AsyncFunction("args", "agent", "parallel", "pipeline", "phase", "log", "budget", "workflow", body);
+} catch (e) {
+  parseError = String(e && e.message ? e.message : e);
+}
+assertEq(parseError, null, "eval-panel.mjs parses as an async Workflow body");
+
+// (3) Spawn wiring, executed (not grepped): run the product body with stub sandbox
+//     globals and inspect the opts every agent() call receives. Pins the PR-5
+//     single-evaluator contract: a fixed agentType at every tier, the Step 3a
+//     evaluator_model forwarded verbatim as opts.model, a stringified `args`
+//     parsed back, and an unresolved model forwarded as opus (an omitted
+//     opts.model would inherit the session model).
+// PR-5 re-point: evaluator_effort is forwarded as opts.effort ONLY when it is
+//     "xhigh"; at "inherit" or undefined opts.effort is absent (the session
+//     effort applies, the same effort the Generator inherits), and any other
+//     value, including a stale "high", is absent AND logs a WARNING.
+console.log("- product-script spawn wiring (stubbed agent / parallel)");
+if (parseError === null) {
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const body = productSrc.replace(/^\s*export\s+const\s+meta\b/m, "const meta");
+  const workflowBody = new AsyncFunction(
+    "args", "agent", "parallel", "pipeline", "phase", "log", "budget", "workflow", body,
+  );
+  const probe = async (args) => {
+    const calls = [];
+    const agent = async (_prompt, opts) => {
+      calls.push(opts || {});
+      return { status: "PASS", acs: [{ id: "AC-1", verdict: "PASS" }], issues: [] };
+    };
+    const parallel = async (thunks) =>
+      Promise.all(thunks.map((x) => (typeof x === "function" ? x() : x)));
+    const noop = () => {};
+    const logs = [];
+    const logStub = (m) => logs.push(String(m));
+    const budgetStub = { total: null, spent: () => 0, remaining: () => Infinity };
+    let result = null;
+    let runError = null;
+    try {
+      result = await workflowBody(args, agent, parallel, noop, noop, logStub, budgetStub, noop);
+    } catch (e) {
+      runError = String(e && e.message ? e.message : e);
+    }
+    return { calls, result, runError, warned: logs.some((m) => m.includes("WARNING")) };
+  };
+  const wiringCases = [
+    // PR-5 re-point: the former opus/high case (effort forwarded) is now opus/inherit
+    // (effort absent, no WARNING); "high" is graded as a stale value below.
+    { label: "opus/inherit", args: { evaluator_model: "opus", evaluator_effort: "inherit" }, model: "opus", effort: undefined, warn: false },
+    { label: "sonnet/inherit", args: { evaluator_model: "sonnet", evaluator_effort: "inherit" }, model: "sonnet", effort: undefined, warn: false },
+    { label: "stale high", args: { evaluator_model: "opus", evaluator_effort: "high" }, model: "opus", effort: undefined, warn: true },
+    { label: "effort undefined", args: { evaluator_model: "opus" }, model: "opus", effort: undefined, warn: false },
+    { label: "sonnet/xhigh", args: { evaluator_model: "sonnet", evaluator_effort: "xhigh" }, model: "sonnet", effort: "xhigh", warn: false },
+    { label: "opus/xhigh", args: { evaluator_model: "opus", evaluator_effort: "xhigh" }, model: "opus", effort: "xhigh", warn: false },
+    {
+      label: "stringified args",
+      args: JSON.stringify({ evaluator_model: "sonnet", evaluator_effort: "xhigh" }),
+      model: "sonnet",
+      effort: "xhigh",
+      warn: false,
+    },
+    {
+      label: "stringified inherit",
+      args: JSON.stringify({ evaluator_model: "opus", evaluator_effort: "inherit" }),
+      model: "opus",
+      effort: undefined,
+      warn: false,
+    },
+    { label: "unresolved {}", args: {}, model: "opus", effort: undefined, warn: true },
+    { label: "garbage values", args: { evaluator_model: "Opus", evaluator_effort: "ultra" }, model: "opus", effort: undefined, warn: true },
+  ];
+  for (const wc of wiringCases) {
+    const { calls, result, runError, warned } = await probe(wc.args);
+    assertEq(runError, null, `${wc.label}: body runs without throwing`);
+    assertEq(calls.length, 3, `${wc.label}: 3 agent() spawns`);
+    assertEq(
+      calls.every((o) => o.agentType === "simple-workflow:ac-evaluator"),
+      true,
+      `${wc.label}: every spawn uses the single agentType simple-workflow:ac-evaluator`,
+    );
+    assertEq(calls.every((o) => o.model === wc.model), true, `${wc.label}: opts.model === ${wc.model} on every spawn`);
+    assertEq(
+      calls.every((o) => (wc.effort === undefined ? !("effort" in o) : o.effort === wc.effort)),
+      true,
+      `${wc.label}: opts.effort ${wc.effort === undefined ? "omitted" : `=== ${wc.effort}`} on every spawn`,
+    );
+    assertEq(result && result.status, "PASS", `${wc.label}: merged result returned`);
+    // A resolved value is forwarded silently; only an unresolved model or an
+    // unrecognised effort logs the WARNING ("inherit" and undefined are silent).
+    assertEq(warned, wc.warn, `${wc.label}: WARNING ${wc.warn ? "logged" : "not logged"}`);
+  }
+}
+
+const total = passes + failures;
+console.log(`\nPASS ${passes}/${total}`);
+if (failures > 0) {
+  console.error(`FAILURES: ${failures}`);
+}
+process.exit(failures ? 1 : 0);

@@ -1,0 +1,22 @@
+{
+  "name": "simple-workflow",
+  "description": "The Claude Code plugin for an end-to-end AI development workflow — ticket management, multi-agent code review, security audit, and automated PR creation — built on a Harness for long-running AI agents with strict context management and cross-session learning.",
+  "version": "11.6.0",
+  "author": {
+    "name": "aimsise",
+    "url": "https://github.com/aimsise"
+  },
+  "homepage": "https://github.com/aimsise/simple-workflow#readme",
+  "repository": "https://github.com/aimsise/simple-workflow",
+  "license": "Apache-2.0",
+  "keywords": [
+    "workflow",
+    "ticket-management",
+    "code-review",
+    "quality-assurance",
+    "sub-agents",
+    "generator-evaluator",
+    "context-conservation",
+    "harness"
+  ]
+}

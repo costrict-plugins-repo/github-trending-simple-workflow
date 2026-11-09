@@ -1,0 +1,163 @@
+---
+name: refactor
+description: >-
+  Plans and executes a refactoring with safety checks by delegating to the
+  planner and code-reviewer agents, then iterating implementation + review up
+  to three rounds. Use when (1) the user runs `/refactor {target}` directly to
+  refactor a specific function, file, or pattern, (2) refactoring is invoked
+  inside a ticket workflow with `ticket-dir={dir-name}` so the review artifact
+  lands at `{ticket-dir}/quality-refactor-{n}.md`, or (3) the user wants the
+  refactor protected by a `backup/pre-refactor-{timestamp}` branch and a
+  bounded review loop. Use only when the user explicitly asks to refactor
+  code. Triggers on "/refactor", "refactor code", "restructure",
+  "extract method", "rename", "clean up".
+disable-model-invocation: true
+allowed-tools:
+  - Agent
+  - Read
+  - Glob
+  - Grep
+  - Write
+  - Edit
+  - "Bash(git:*)"
+  - "Bash(npm:*)"
+  - "Bash(npx:*)"
+  - "Bash(yarn:*)"
+  - "Bash(pnpm:*)"
+  - "Bash(bun:*)"
+  - "Bash(pytest:*)"
+  - "Bash(cargo:*)"
+  - "Bash(go :*)"
+  - "Bash(make:*)"
+  - "Bash(gradle:*)"
+  - "Bash(./gradlew:*)"
+  - "Bash(mvn:*)"
+  - "Bash(./mvnw:*)"
+  - "Bash(sbt:*)"
+  - "Bash(dotnet test:*)"
+  - "Bash(dotnet build:*)"
+  - "Bash(bundle exec:*)"
+  - "Bash(rake:*)"
+  - "Bash(mix:*)"
+  - "Bash(swift test:*)"
+  - "Bash(swift build:*)"
+  - "Bash(flutter test:*)"
+  - "Bash(dart test:*)"
+  - "Bash(composer:*)"
+  - "Bash(./vendor/bin/phpunit:*)"
+argument-hint: "<refactoring target and goal> [ticket-dir=<dir-name>]"
+---
+
+Plan and execute refactoring: $ARGUMENTS
+
+## Pre-computed Context
+
+Available user skills: !`( ls -1 ~/.claude/skills 2>/dev/null ; ls -1 .claude/skills 2>/dev/null ) | sort -u | grep . | tr "\n" "," | sed "s/,$//" | grep . || echo "(none)"`
+
+Available MCP servers: !`( jq -r '.mcpServers // {} | keys[]' .mcp.json 2>/dev/null ; jq -r '.mcpServers // {} | keys[]' ~/.claude.json 2>/dev/null ) | sort -u | grep . | tr "\n" "," | sed "s/,$//" | grep . || echo "(none)"`
+
+## Argument Parsing
+
+Parse `$ARGUMENTS` for the following:
+- `ticket-dir=<dir-name>` (case-insensitive key): Optional ticket directory name (directory name only, not a full path — e.g., `003-fix-login`). When provided, this value is used in Step 1b to construct the full path `.simple-workflow/backlog/active/{dir-name}` instead of inferring the ticket directory from the branch name.
+- All other tokens are treated as the refactoring target and goal description.
+
+Current state:
+!`git status --short 2>/dev/null || true`
+!`git diff --stat 2>/dev/null || true`
+
+Current branch:
+!`git branch --show-current 2>/dev/null || true`
+
+Active tickets:
+!`ls -d .simple-workflow/backlog/active/*/ 2>/dev/null || echo "(none)"`
+
+Invocation policy: Do not auto-invoke. `disable-model-invocation: true` is intentional because `/refactor` performs destructive changes (file edits, possible structural moves) and creates a `backup/pre-refactor-{timestamp}` branch as the only rollback point. The safety design assumes the user has made an explicit decision to refactor; chain-call from another skill is not supported without re-evaluating that assumption. Manual `/refactor <target>` invocation is the sole supported entry point. Flipping `disable-model-invocation` to `false` is not appropriate without re-evaluating the safety checkpoint design (in particular the backup-branch contract in Phase 2 Step 3b and the bounded review loop in Phase 3).
+
+## Mandatory Skill Invocations
+
+`/refactor` is a two-agent orchestrator: it MUST delegate planning to the `planner` agent and quality review to the `code-reviewer` agent. The orchestrator itself writes no plan content and produces no review report; its role is argument parsing, ticket detection, backup-branch creation, implementation orchestration, and loop control.
+
+| Invocation Target | When | Skip consequence |
+|---|---|---|
+| `planner` agent (Agent tool) | Phase 1 Step 1 — always, before user approval is sought | No refactoring plan exists; Phase 2 has nothing to seek approval for; Phase 3 has no scope to implement against. Detected by the absence of a planner agent return value in the conversation transcript. |
+| `code-reviewer` agent (Agent tool) | Phase 3 Step 6 — each iteration of the implement → verify → review loop, up to 3 iterations | Quality review SKIPPED; Critical and Warning findings cannot be detected; loop exit condition `Critical = 0 AND Warning = 0` cannot be evaluated, so Critical bugs may slip through unverified. Detected by absence of the configured output file (`{ticket-dir}/quality-refactor-{n}.md` or the default `.simple-workflow/docs/reviews/{topic}.md`). |
+| `doc-verifier` agent (Agent tool) | Phase 3 Step 6 — in parallel with code-reviewer when `constraints.selfdoc_verification` is active AND the refactor touches a documentation / advertised-interface surface | No EC-SELFDOC verification; a refactor that silently breaks a docstring / README / `--help` worked-example, or shifts an advertised boundary, ships unverified. Detected by absence of `doc-verify-{n}.md` when the trigger fired. |
+
+**Binding rules**:
+- `MUST invoke the simple-workflow:planner agent` in Phase 1 Step 1 before presenting any plan summary to the user. The orchestrator MUST NOT fabricate a plan in lieu of the planner return value.
+- `MUST invoke the simple-workflow:code-reviewer agent` in every iteration of Phase 3 Step 6 (up to the 3-iteration ceiling). The orchestrator MUST NOT skip review by self-judging "no issues".
+- `MUST invoke the simple-workflow:doc-verifier agent` in each Phase 3 Step 6 iteration when `constraints.selfdoc_verification` is active AND the refactor touches a documentation / advertised-interface surface. The orchestrator MUST NOT self-judge doc truthfulness; skip only via `constraints.selfdoc_verification: off` or the no-doc-surface path.
+- `NEVER bypass the code-reviewer` by treating an Agent-tool infrastructure failure as a clean review — Phase 3 Step 7 defines the explicit `AskUserQuestion` fallback (`stop` / `continue without review`) and the non-interactive default-to-stop; bypass is allowed only via that documented path.
+- `Fail the task immediately` when the planner agent cannot be invoked at all (no fallback exists — Phase 2 backup branch creation cannot proceed without a plan). Print the failure reason and stop.
+
+## Instructions
+
+### Phase 1: Planning
+1. Spawn the **simple-workflow:planner** agent to create a refactoring plan. Before constructing the spawn prompt:
+   - **Resolve `ticket-dir`** by running the ticket-detection logic from Step 1b below (it is referenced here as well as later in Phase 3 Step 6). Set `ticket-dir` to either the resolved path or `(none)` when no match is found.
+   - **Capability binding pre-load** (v8.0.0): when `ticket-dir` resolves and `{ticket-dir}/ticket.md` exists with a `### Capabilities` section, `Read` it and inline the full table verbatim into the planner spawn prompt under the heading `## Bound capabilities (per AC)`. When the ticket lacks `### Capabilities` (older ticket pre-dating Gate 6), inline `## Bound capabilities (per AC): (none recorded — ticket pre-dates Gate 6)`. When `ticket-dir` is `(none)`, skip the binding block — the planner authors from scratch using the `Available capabilities` probe.
+   - **Advisory capability pre-load** (v8.0.0+, Gate 6.5): also extract the `### Advisory Capabilities` table from the same `ticket.md` (if present per `skills/create-ticket/references/ac-quality-criteria.md` Gate 6.5). Inline the full Advisory table verbatim into the planner spawn prompt under `## Advisory capabilities (per ticket)`. When the section is absent or empty, inline `## Advisory capabilities (per ticket): (none)`. The Advisory block primes the planner to preserve / refine the prior advisory classification on retry re-emits; when `ticket-dir` is `(none)` the planner authors the Advisory section from scratch using the `Available capabilities` probe per Gate 6.5.
+   - **`Available capabilities` probe**: always inline the `Available user skills:` and `Available MCP servers:` lines from the Pre-computed Context above so the planner (authoring role) can populate Gate 6 rows AND complete the Gate 6.5 probe-classification cross-check (every probe entry MUST be Bound / Advisory / Skipped — see Gate 6.5 in `skills/create-ticket/references/ac-quality-criteria.md`).
+   - **Rubric path**: pass the rubric's absolute path in the spawn prompt — `${CLAUDE_PLUGIN_ROOT}/skills/create-ticket/references/ac-quality-criteria.md` with the variable expanded (the plugin-relative path does not exist in the user's repository) — so the planner can `Read` the Gate 6 / 6.5 content rules per `agents/planner.md` Pre-emit Self-Audit step 6.
+1b. **Ticket detection**: Get the current branch name and active ticket list from the pre-computed context above. Determine `ticket-dir` using the following priority:
+   - **Explicit `ticket-dir=` argument**: If `ticket-dir=<dir-name>` was provided in the arguments, check whether `.simple-workflow/backlog/active/{dir-name}` exists. If it exists, set `ticket-dir` to `.simple-workflow/backlog/active/{dir-name}` and skip branch name matching. If it does **not** exist, print a WARNING: "ticket-dir '{dir-name}' not found in .simple-workflow/backlog/active/ — falling back to branch name matching." and proceed to the fallback below.
+   - **Fallback — branch name matching**: For each directory in `.simple-workflow/backlog/active/`, extract the slug portion by stripping the leading `NNN-` prefix (the initial sequence of digits followed by a hyphen, e.g., `001-add-search-feature` → `add-search-feature`). Check if the branch name contains this slug portion. If a match is found, set `ticket-dir` to `.simple-workflow/backlog/active/{full-directory-name}` (including the numeric prefix).
+2. Present the plan summary to the user
+
+### Phase 2: Approval
+3. Ask the user to approve before proceeding. If rejected, gather feedback and re-plan (return to Phase 1).
+
+3b. **Safety checkpoint**: After user approval, create a backup branch:
+    - Run `git branch backup/pre-refactor-$(date +%Y%m%d-%H%M%S)` to save current state
+    - Print: "Backup branch created: backup/pre-refactor-{timestamp}. To rollback: git checkout backup/pre-refactor-{timestamp}"
+
+### Phase 3: Implementation + Review Loop (max 3 iterations)
+4. Implement changes according to the plan
+5. Run verification:
+   - Run the project's test command (as defined in CLAUDE.md or project conventions)
+   - Run the project's lint command (as defined in CLAUDE.md or project conventions)
+6. Spawn the **simple-workflow:code-reviewer** agent to review all changes:
+   - **Capability binding pre-load** (v8.0.0): when `ticket-dir` is set (resolved in Step 1 / Step 1b) and `{ticket-dir}/ticket.md` exists with a `### Capabilities` section, inline the full table verbatim into the code-reviewer spawn prompt under `## Bound capabilities (per AC)`. The code-reviewer is a Skill-bearing Group C agent that consumes the deterministic per-AC binding (never speculative — see `## Subagent Skill-Access Handoff` below). When the ticket lacks `### Capabilities`, inline `## Bound capabilities (per AC): (none recorded — ticket pre-dates Gate 6)`.
+   - If `ticket-dir` is set: specify output path as `{ticket-dir}/quality-refactor-{n}.md` where {n} is the iteration number
+   - If `ticket-dir` is not set: let the code-reviewer use its default (`.simple-workflow/docs/reviews/{topic}.md`)
+   - **doc-verifier (EC-SELFDOC, v8.4.1+)**: in the SAME iteration, when `constraints.selfdoc_verification` is active (read from `{ticket-dir}/autopilot-policy.yaml`; absent file / field / unknown → `auto` = active) AND the refactor touches a documentation / advertised-interface surface (a `README` / `*.md` / `--help` / man-page, or a Gate 9 R3 / R4 AC in the ticket), **also spawn the `simple-workflow:doc-verifier` agent in parallel** with code-reviewer to RUN the unit's advertised examples / boundary claims against the post-refactor build under the `.simple-workflow/scratch/` carve-out. Output path `{ticket-dir}/doc-verify-{n}.md` (or the default `.simple-workflow/docs/reviews/doc-verify-{topic}.md`); inline the ticket's `#### Failure-Class Coverage (Gate 9)` R3 / R4 rows when present. Fold a doc-verifier `FAIL` / `FAIL-CRITICAL` (a non-reproducing example or advertised≠enforced boundary) into the Step 7 loop-exit tally exactly as a code-reviewer Critical; a `PASS-WITH-CAVEATS` (build unrunnable, fail-open) is not a Critical. Skip when `constraints.selfdoc_verification: off` or no doc surface is touched.
+7. Evaluate review results:
+   - **code-reviewer Status: failed or partial** (review infrastructure failure):
+     Use `AskUserQuestion` to ask "code-reviewer failed. How do you want to proceed?" with options:
+     - "stop": stop the skill immediately. Print "Stopped by user after code-reviewer failure. Refactoring changes remain in working tree." and exit.
+     - "continue without review": proceed to Phase 4 without quality verification, noting "Quality review SKIPPED (code-reviewer failed)" in the final summary.
+     - When `/refactor` is invoked under `/autopilot` (i.e. the autopilot-mode path — `ticket-dir=` is set and an `autopilot-policy.yaml` exists in the ticket dir), the `AskUserQuestion` MUST set `header: audit-fail` (equivalent to `audit_infrastructure_fail` on the 3-tier risk_tolerance matrix); see `skills/autopilot/SKILL.md` `## Non-interactive orchestrator contract (3-tier, risk_tolerance-aware)`. Any other header (or an empty one) is denied at every tier when invoked under `/autopilot`. Standalone (non-autopilot) invocations retain the prior behaviour and need not set the `header` field.
+     - **Non-interactive environment fallback**: If `AskUserQuestion` is unavailable or returns an error (typical in `claude -p` / CI automation where stdin is not a TTY), default to **stop**. Print "Stopped: /refactor cannot proceed without code-reviewer in non-interactive mode. Refactoring changes remain in working tree. Re-run in interactive mode." and exit. Do NOT hang waiting for input.
+     - **Never** silently treat code-reviewer failure as "no issues" — that would let Critical bugs slip through unverified.
+   - **Critical = 0 AND Warning = 0** -> exit loop, proceed to Phase 4
+   - **Issues found** -> fix the reported issues, then return to step 5
+   - **Iteration 3 reached** -> exit loop with remaining issues noted
+
+### Phase 4: Final Report
+8. Report summary:
+   - Changes made (files modified, lines changed)
+   - Review iterations completed
+   - Remaining issues (if loop exited at max iterations)
+   - Test and lint final status
+
+`/refactor` does NOT emit a `[SW-CHECKPOINT]` block. The Final Report above is the canonical end-of-skill artifact; downstream tooling that watches for checkpoint markers should ignore `/refactor` invocations. See `skills/create-ticket/references/sw-checkpoint-template.md` for the canonical block contract and the list of skills that DO emit it.
+
+## Error Handling
+
+- **Empty arguments**: Print `Usage: /refactor <refactoring target and goal> [ticket-dir=<dir-name>]` and stop.
+- **planner agent failure** (Phase 1 Step 1): Print the failure reason and stop before Phase 2. Do not create a backup branch when there is no plan to back up against.
+- **Backup branch failure** (Phase 2 Step 3b): If `git branch backup/pre-refactor-$(date +%Y%m%d-%H%M%S)` fails (e.g. duplicate timestamp under rapid re-runs, working-tree conflict), print the error and stop before Phase 3. Do not proceed with destructive implementation without a successful safety branch.
+- **code-reviewer agent failure** (Phase 3 Step 6): Handled inline by Phase 3 Step 7 — `AskUserQuestion` prompts the user with `stop` / `continue without review`. In non-interactive environments (`claude -p` / CI), the default is `stop`. Never silently treat the failure as "no issues found".
+- **Loop exit at max iterations** (Phase 3 Step 7): If iteration 3 is reached with remaining Critical or Warning findings, exit the loop and report the remaining findings in Phase 4 Final Report. Do not silently retry beyond the 3-iteration ceiling.
+
+## Subagent Skill-Access Handoff
+
+When you spawn a subagent via the Agent tool, consult the `Available user skills:` line in the Pre-computed Context above. If a listed utility skill is relevant to that subagent's task, name it in the Agent prompt and instruct the subagent to use it via the Skill tool when it materially helps.
+
+- **Truly hermetic agents** (`security-scanner`, `ticket-evaluator`) carry no Skill tool, no MCP, no `Bash(*)`. If you spawn one, hand off nothing — speculative references only add noise.
+- **Skill-bearing verdict / read-only agents** (`ac-evaluator`, `code-reviewer`, `decomposer`, `tune-analyzer`) retain explicit `tools:` allowlists and do NOT inherit MCP / `Bash(*)`. They DO carry the Skill tool and receive capability handoffs, but only via **deterministic per-AC binding** (the `## Bound capabilities (per AC)` block extracted from `{ticket-dir}/ticket.md`'s `### Capabilities` section) — never via ad-hoc speculation from the `Available user skills:` probe.
+- **Productive agents** (`implementer`, `planner`, `researcher`, `test-writer`) inherit-all under v8.0.0 — every parent-session MCP server and `Bash(*)` is in their tool inventory. Only `mcp__*` and Skills bound to an active AC via `## Bound capabilities (per AC)` may be invoked (per the agent body's `## Bound Capabilities (Handoff from Orchestrator)` section).
+- Never present a pipeline skill (`/scout`, `/impl`, `/audit`, `/ship`, `/autopilot`, `/brief`, `/catchup`, `/create-ticket`, `/investigate`, `/plan2doc`, `/refactor`, `/test`, `/tune`) as a utility for a subagent.
+- When a ticket's `### Capabilities` section exists (resolve via `{ticket-dir}/ticket.md` or the autopilot state file's `paths.ticket`), `Read` it before constructing any subagent spawn prompt and inline the bound capabilities verbatim into every spawn prompt under the heading `## Bound capabilities (per AC)`. For per-AC spawns (one spawn per AC, e.g. `/impl` Steps 13/15), include only the rows whose `Bound AC(s)` column lists the active AC. For tip / whole-deliverable spawns (the rest), include the full table. The upstream binding is authoritative — do NOT re-derive relevance from the AC text or re-scan `Available user skills:` for plausible matches. When the ticket lacks `### Capabilities` (older ticket pre-dating Gate 6), emit `## Bound capabilities (per AC): (none recorded — ticket pre-dates Gate 6)` in the spawn prompt and let the subagent fall back to its in-house capability-selection path.
+- If the `Available user skills:` probe reports `(none)`, hand off nothing and let the subagent proceed with its in-house capabilities.

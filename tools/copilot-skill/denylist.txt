@@ -1,0 +1,100 @@
+# Exit-audit denylist: one ERE per line (grep -E, LC_ALL=C), run over every
+# generated file. Any hit fails the build and is reported as file:line.
+# Comment and blank lines are ignored.
+
+# Plugin namespace, plugin variables, dynamic skill syntax
+simple-workflow:
+CLAUDE_
+\$ARGUMENTS
+!`
+# Host names and host-bound vocabulary: the skill is host-neutral
+Copilot
+GitHub\.com
+cloud agent
+agent_type
+on (this|a|the) surface\b
+surface offers no
+# Claude Code tool and runtime vocabulary
+AskUserQuestion
+Agent tool
+Skill tool
+`skill` tool
+ToolSearch
+InputValidationError
+deferred tool
+maxTurns
+\bmodel: (opus|sonnet|inherit)
+\beffort\b
+SubagentStop
+Claude
+claude -p
+\.mcp\.json
+claude\.json
+context: fork
+# Plugin pipeline machinery that the standalone skill does not have
+hooks/
+phase-state
+autopilot-policy
+SW-CHECKPOINT
+fix_structure
+ac-evaluator-hi
+brief_mode
+gates\.ticket_quality_fail
+runtime_metrics
+SIMPLE_WORKFLOW_DISABLE_DECOMPOSER
+decomposer capability disabled
+(^|[^A-Za-z0-9])[FBD]-0([^0-9]|$)
+Step[ -]0([^0-9]|$)
+(^|[^A-Za-z0-9_/-])/(impl|scout|ship|autopilot|plan2doc|refactor|brief|catchup|investigate|test|tune|audit)\b
+(^|[^/.A-Za-z0-9_-])skills/(impl|scout|ship|autopilot|plan2doc|refactor|brief|catchup|investigate|test|tune|audit|create-ticket)/
+(the|this) plugin\b|plugin root|plugin-relative|plugin's
+# Files that are deliberately not shipped
+workflow-patterns
+sw-checkpoint-template
+ac-quality-criteria-history
+autopilot-foldin
+# Personal information
+/Users/
+/home/
+# Decoupling: the generated skill must not depend on the plugin, its
+# backlog layout, its per-ticket directories or its investigation reuse path
+# (a local: destination keeps its own .ticket-counter, which stays allowed)
+simple-workflow
+\.simple-workflow
+product_backlog
+\{ticket-dir\}
+investigation_sha256
+Common Write Path
+Step W-[0-9]
+ticket-policy
+NOT EVALUATED
+mcp\.json
+Phase 1\.5
+ADVISORY-CONSULT
+\*\*P\?\*\*
+# Plugin-internal jargon nothing in the generated tree defines: the eval
+# panel and its lens, the evidence-floor shorthands, the failure-class
+# lettering, the upstream role names and the generator's own paths
+# ("downstream implementer/verifier" is the one defined role phrase)
+eval_panel
+L-UNIFORMITY
+[Ii]mpl-side
+\+1-independent
+EC-STATIC\+natural
+failure (mode|class) [A-Z]\b
+downstream AC evaluator
+downstream implementation step
+downstream verifier\b
+ac-evaluator
+main-thread
+load-bearing
+(^|[^-A-Za-z0-9_])plan\.md
+Mandatory Skill Invocations
+upstream brief
+build-copilot-skill
+Stopped:
+(^|[^/A-Za-z0-9_.-])tools/
+# The ticket draft has no ### Limitations heading
+Limitations` of your output file
+# A capitalised Read mid-sentence is the Claude Code tool name
+([a-z,] |\()Read\b

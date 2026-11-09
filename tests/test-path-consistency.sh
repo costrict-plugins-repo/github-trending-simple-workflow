@@ -1,0 +1,1279 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/test-helper.sh"
+
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# --- Local helpers ---
+
+assert_file_contains() {
+  local description="$1"
+  local file="$2"
+  local pattern="$3"
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  if grep -qE -- "$pattern" "$file"; then
+    echo -e "  ${GREEN}PASS${NC} $description"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} $description"
+    echo -e "       File: $file"
+    echo -e "       Expected pattern: $pattern"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+}
+
+assert_file_not_contains() {
+  local description="$1"
+  local file="$2"
+  local pattern="$3"
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  if ! grep -qE "$pattern" "$file"; then
+    echo -e "  ${GREEN}PASS${NC} $description"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} $description"
+    echo -e "       File: $file"
+    echo -e "       Unexpected pattern found: $pattern"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+}
+
+echo "=== Path Consistency Tests ==="
+echo ""
+
+# --- Category 1: Agents support caller-specified output paths ---
+echo "--- Agents support caller-specified output paths ---"
+
+assert_file_contains \
+  "security-scanner.md supports caller-specified path" \
+  "$REPO_DIR/agents/security-scanner.md" \
+  "specified by the caller"
+
+assert_file_contains \
+  "code-reviewer.md supports caller-specified path" \
+  "$REPO_DIR/agents/code-reviewer.md" \
+  "specified by the caller"
+
+assert_file_contains \
+  "ac-evaluator.md supports caller-specified path" \
+  "$REPO_DIR/agents/ac-evaluator.md" \
+  "specified by the caller"
+
+echo ""
+
+# --- Category 2: No stale hardcoded output paths ---
+echo "--- No stale hardcoded output paths ---"
+
+assert_file_not_contains \
+  "security-scanner.md has no stale 'Write full audit report to'" \
+  "$REPO_DIR/agents/security-scanner.md" \
+  "Write full audit report to"
+
+assert_file_not_contains \
+  "code-reviewer.md has no stale 'more than 20' condition" \
+  "$REPO_DIR/agents/code-reviewer.md" \
+  "more than 20"
+
+echo ""
+
+# --- Category 3: Ticket-facing skills have ticket detection ---
+echo "--- Ticket-facing skills have ticket detection ---"
+
+assert_file_contains \
+  "audit/SKILL.md references ticket-dir" \
+  "$REPO_DIR/skills/audit/SKILL.md" \
+  "ticket-dir"
+
+assert_file_contains \
+  "audit/SKILL.md references .simple-workflow/backlog/active" \
+  "$REPO_DIR/skills/audit/SKILL.md" \
+  "\.simple-workflow/backlog/active"
+
+assert_file_contains \
+  "plan2doc/SKILL.md searches .simple-workflow/backlog for tickets" \
+  "$REPO_DIR/skills/plan2doc/SKILL.md" \
+  "search.*\.simple-workflow/backlog"
+
+assert_file_contains \
+  "impl/SKILL.md uses branch matching for eval-round" \
+  "$REPO_DIR/skills/impl/SKILL.md" \
+  "slug.*portion|strip.*prefix|branch.*contains"
+
+assert_file_contains \
+  "refactor/SKILL.md references ticket-dir or .simple-workflow/backlog/active" \
+  "$REPO_DIR/skills/refactor/SKILL.md" \
+  "ticket-dir|\.simple-workflow/backlog/active"
+
+assert_file_contains \
+  "autopilot/SKILL.md references ticket-dir" \
+  "$REPO_DIR/skills/autopilot/SKILL.md" \
+  "ticket-dir"
+
+assert_file_not_contains \
+  "autopilot/SKILL.md has no stale ticket-slug" \
+  "$REPO_DIR/skills/autopilot/SKILL.md" \
+  '\{ticket-slug\}'
+
+echo ""
+
+# --- Category 4: Cross-reference consistency ---
+echo "--- Cross-reference consistency ---"
+
+assert_file_contains \
+  "audit/SKILL.md references quality-round" \
+  "$REPO_DIR/skills/audit/SKILL.md" \
+  "quality-round"
+
+assert_file_contains \
+  "audit/SKILL.md references security-scanner" \
+  "$REPO_DIR/skills/audit/SKILL.md" \
+  "security-scanner"
+
+assert_file_contains \
+  "audit/SKILL.md returns Status field" \
+  "$REPO_DIR/skills/audit/SKILL.md" \
+  "\*\*Status\*\*"
+
+assert_file_contains \
+  "refactor/SKILL.md references quality-refactor" \
+  "$REPO_DIR/skills/refactor/SKILL.md" \
+  "quality-refactor"
+
+echo ""
+
+# --- Category 5: Skill structural validity ---
+echo "--- Skill structural validity ---"
+
+# Helper: extract a YAML scalar field from a frontmatter block.
+# Reads the first `--- ... ---` block of $1 and returns the value of field $2.
+extract_frontmatter_field() {
+  local file="$1"
+  local field="$2"
+  awk -v field="$field" '
+    BEGIN { in_fm = 0; depth = 0 }
+    /^---[[:space:]]*$/ {
+      depth++
+      if (depth == 1) { in_fm = 1; next }
+      if (depth == 2) { exit }
+    }
+    in_fm && $0 ~ "^"field":" {
+      sub("^"field":[[:space:]]*", "", $0)
+      sub(/^"/, "", $0); sub(/"$/, "", $0)
+      sub(/^>-?[[:space:]]*$/, "", $0)
+      print $0
+      exit
+    }
+  ' "$file"
+}
+
+assert_skill_frontmatter_valid() {
+  local skill_dir="$1"
+  local skill_slug
+  skill_slug=$(basename "$skill_dir")
+  local skill_md="$skill_dir/SKILL.md"
+
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  if [ ! -f "$skill_md" ]; then
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md exists"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    return
+  fi
+
+  # Must start with YAML frontmatter
+  if ! head -1 "$skill_md" | grep -qE '^---[[:space:]]*$'; then
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md starts with YAML frontmatter"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    return
+  fi
+
+  local name
+  name=$(extract_frontmatter_field "$skill_md" "name")
+  if [ "$name" != "$skill_slug" ]; then
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md frontmatter 'name' matches dir"
+    echo -e "       Expected: $skill_slug"
+    echo -e "       Got: $name"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    return
+  fi
+
+  # description must be present (non-empty after extraction OR followed by a multi-line block)
+  if ! grep -qE '^description:' "$skill_md"; then
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md frontmatter has 'description' field"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    return
+  fi
+
+  echo -e "  ${GREEN}PASS${NC} skills/$skill_slug/SKILL.md frontmatter is valid (name=$name)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+}
+
+assert_skill_has_body_sections() {
+  # A skill must have at least one '##' heading in its body (i.e. structural
+  # content beyond the frontmatter). Delegator skills typically have just
+  # '## Instructions'; orchestrator skills (/impl, /ship) use '## Phase N'.
+  # Either is fine — we only catch frontmatter-only / empty-body files.
+  local skill_dir="$1"
+  local skill_slug
+  skill_slug=$(basename "$skill_dir")
+  local skill_md="$skill_dir/SKILL.md"
+
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  local heading_count
+  heading_count=$(count_matches '^## ' "$skill_md")
+  if [ "$heading_count" -ge 1 ]; then
+    echo -e "  ${GREEN}PASS${NC} skills/$skill_slug/SKILL.md has body sections (${heading_count} '##' headings)"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md has body sections (need >= 1 '##' heading, got 0)"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+}
+
+for skill_dir in "$REPO_DIR"/skills/*/; do
+  assert_skill_frontmatter_valid "$skill_dir"
+  assert_skill_has_body_sections "$skill_dir"
+done
+
+echo ""
+
+# --- Category 6: Agent structural validity (v8.0.0 plane) ---
+#
+# v8.0.0 splits agents into two groups:
+#   Group A (4 productive agents — implementer / planner / researcher /
+#   test-writer) omit the `tools:` field so they inherit the parent session's
+#   full tool inventory (including MCP servers). For these, `^tools:` MUST be
+#   ABSENT from the frontmatter block.
+#
+#   Group C (7 verdict / read-only agents — ac-evaluator / code-reviewer /
+#   decomposer / doc-verifier / security-scanner / ticket-evaluator /
+#   tune-analyzer) retain
+#   their explicit `tools:` allowlists for verdict independence / read-only
+#   invariants. For these, `^tools:` MUST be PRESENT.
+#
+# In both groups, `name:` and `description:` are still required.
+echo "--- Agent structural validity ---"
+
+# Group A — productive agents that omit tools: (must NOT have ^tools: in
+# frontmatter; v8.0.0 inherit-all).
+GROUP_A_AGENTS=(
+  "implementer"
+  "planner"
+  "researcher"
+  "test-writer"
+)
+
+# Group C — verdict / read-only agents that retain explicit tools: allowlist.
+# doc-verifier is the EC-SELFDOC / doc-truthfulness verifier (v8.4.0+): a Group C
+# read-only agent with an explicit scoped tools: allowlist (scratch-only build/run
+# exec for advertised-example reproduction).
+# PR-5 re-point: the M5 opus twin of ac-evaluator was retired (one evaluator file, per-spawn
+# model / effort); its Group C slot is replaced by the frontmatter check after the loops below.
+GROUP_C_AGENTS=(
+  "ac-evaluator"
+  "code-reviewer"
+  "decomposer"
+  "doc-verifier"
+  "security-scanner"
+  "ticket-evaluator"
+  "tune-analyzer"
+)
+
+# Extract just the YAML frontmatter block (between the first two `---` lines)
+# into a temp file so per-agent grep checks don't accidentally pick up `tools:`
+# strings in the body prose.
+extract_agent_frontmatter() {
+  local agent_md="$1"
+  awk '
+    BEGIN { fences=0 }
+    /^---[[:space:]]*$/ { fences++; if (fences==2) exit; next }
+    fences==1 { print }
+  ' "$agent_md"
+}
+
+assert_agent_frontmatter_valid_v8() {
+  local agent_md="$1"
+  local expect_tools="$2"  # "yes" for Group C, "no" for Group A
+  local agent_basename
+  agent_basename=$(basename "$agent_md" .md)
+
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+
+  if ! head -1 "$agent_md" | grep -qE '^---[[:space:]]*$'; then
+    echo -e "  ${RED}FAIL${NC} agents/$agent_basename.md starts with YAML frontmatter"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    return
+  fi
+
+  local name
+  name=$(extract_frontmatter_field "$agent_md" "name")
+  if [ "$name" != "$agent_basename" ]; then
+    echo -e "  ${RED}FAIL${NC} agents/$agent_basename.md frontmatter 'name' matches filename"
+    echo -e "       Expected: $agent_basename"
+    echo -e "       Got: $name"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    return
+  fi
+
+  local fm
+  fm=$(extract_agent_frontmatter "$agent_md")
+
+  if ! grep -qE -- '^description:' <<<"$fm"; then
+    echo -e "  ${RED}FAIL${NC} agents/$agent_basename.md frontmatter has 'description'"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    return
+  fi
+
+  if [ "$expect_tools" = "yes" ]; then
+    if ! grep -qE -- '^tools:' <<<"$fm"; then
+      echo -e "  ${RED}FAIL${NC} agents/$agent_basename.md frontmatter has 'tools' (Group C: explicit allowlist required)"
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      return
+    fi
+    echo -e "  ${GREEN}PASS${NC} agents/$agent_basename.md frontmatter is valid (name=$name, Group C: has tools:)"
+  else
+    if grep -qE -- '^tools:' <<<"$fm"; then
+      echo -e "  ${RED}FAIL${NC} agents/$agent_basename.md frontmatter MUST NOT have 'tools' (Group A: v8.0.0 inherit-all omit)"
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      return
+    fi
+    echo -e "  ${GREEN}PASS${NC} agents/$agent_basename.md frontmatter is valid (name=$name, Group A: tools: omitted)"
+  fi
+
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+}
+
+for slug in "${GROUP_A_AGENTS[@]}"; do
+  assert_agent_frontmatter_valid_v8 "$REPO_DIR/agents/$slug.md" "no"
+done
+
+for slug in "${GROUP_C_AGENTS[@]}"; do
+  assert_agent_frontmatter_valid_v8 "$REPO_DIR/agents/$slug.md" "yes"
+done
+
+# PR-5 re-point (replaces the retired opus twin's Group C slot): the single evaluator file
+# pins `model: opus` in its frontmatter (the fallback when a spawner passes no per-spawn
+# model) and carries NO `effort:` key, mirroring the generator agents/implementer.md, so a
+# routine spawn inherits the session effort exactly as the generator does; and every agent
+# frontmatter `effort:` key carries a level the harness accepts (low | medium | high |
+# xhigh | max).
+# PR-5 re-point: `effort: high` present (expected 1) -> any `effort:` line (expected 0).
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+acev_fm=$(extract_agent_frontmatter "$REPO_DIR/agents/ac-evaluator.md")
+acev_fm_opus=$(grep -cE -- '^model: opus([[:space:]]|$)' <<<"$acev_fm" || true)
+acev_fm_effort=$(grep -cE -- '^effort:' <<<"$acev_fm" || true)
+# PR-5 re-point: mirror the generator side of the invariant, agents/implementer.md also
+# carries no `effort:` key (both agents run at the session effort on a routine spawn).
+impl_fm_effort=$(extract_agent_frontmatter "$REPO_DIR/agents/implementer.md" | grep -cE -- '^effort:' || true)
+# Rubric-split / ticket-grading extension: the ticket-side evaluator agents/ticket-evaluator.md
+# also carries NO `effort:` key (it formerly pinned `effort: high`, which REPLACED the session
+# effort and made it grade below the planner in an xhigh / max session), so it grades at the
+# session effort the planner (no `effort:` key) drafts at; its model stays `inherit`.
+tev_fm=$(extract_agent_frontmatter "$REPO_DIR/agents/ticket-evaluator.md")
+tev_fm_effort=$(grep -cE -- '^effort:' <<<"$tev_fm" || true)
+tev_fm_inherit=$(grep -cE -- '^model: inherit([[:space:]]|$)' <<<"$tev_fm" || true)
+bad_effort=""
+for agent_md in "$REPO_DIR"/agents/*.md; do
+  eff=$(extract_agent_frontmatter "$agent_md" | awk '/^effort:/{sub(/^effort:[[:space:]]*/, ""); sub(/[[:space:]]*#.*$/, ""); print; exit}')
+  if [ -n "$eff" ]; then
+    case "$eff" in
+      low|medium|high|xhigh|max) ;;
+      *) bad_effort="$bad_effort $(basename "$agent_md" .md)=$eff" ;;
+    esac
+  fi
+done
+if [ "$acev_fm_opus" -eq 1 ] && [ "$acev_fm_effort" -eq 0 ] && [ "$impl_fm_effort" -eq 0 ] \
+   && [ "$tev_fm_effort" -eq 0 ] && [ "$tev_fm_inherit" -eq 1 ] && [ -z "$bad_effort" ]; then
+  echo -e "  ${GREEN}PASS${NC} agents/ac-evaluator.md frontmatter pins model: opus with no effort: key, agents/implementer.md (the generator) has no effort: key either, agents/ticket-evaluator.md keeps model: inherit with no effort: key, and every agent effort: key is a valid level"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} single-evaluator frontmatter / agent effort levels (model: opus=$acev_fm_opus expected 1, effort: lines=$acev_fm_effort expected 0, implementer effort: lines=$impl_fm_effort expected 0, ticket-evaluator effort: lines=$tev_fm_effort expected 0, ticket-evaluator model: inherit=$tev_fm_inherit expected 1, invalid effort:${bad_effort:- none})"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 7: Agent reference reachability ---
+# Every agent in agents/ must be referenced by at least one skill (or another agent)
+# so we catch dead agents and renames that lose all callers.
+echo "--- Agent reference reachability ---"
+
+for agent_md in "$REPO_DIR"/agents/*.md; do
+  agent_basename=$(basename "$agent_md" .md)
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+
+  # Search for agent name in any skill or other agent file (excluding self)
+  hits=$(grep -RIl --include="*.md" -F "$agent_basename" "$REPO_DIR/skills" "$REPO_DIR/agents" 2>/dev/null \
+         | grep -vF "$agent_md" || true)
+  if [ -n "$hits" ]; then
+    echo -e "  ${GREEN}PASS${NC} agent '$agent_basename' is referenced from at least one skill/agent"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} agent '$agent_basename' is not referenced anywhere — dead agent?"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+done
+
+# PR-5 re-point (replaces the retired opus twin's reachability row): the inverse direction.
+# Every namespaced `simple-workflow:<name>` reference under skills/ agents/ hooks/ must resolve
+# to an existing agents/<name>.md or skills/<name>/SKILL.md, so a retired or renamed agent
+# cannot leave a dangling spawn target or denylist entry behind.
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+ns_refs=$( { grep -rhoE 'simple-workflow:[a-z0-9][a-z0-9-]*' "$REPO_DIR/skills" "$REPO_DIR/agents" "$REPO_DIR/hooks" 2>/dev/null || true; } | sort -u)
+ns_count=0
+ns_dangling=""
+while IFS= read -r ns_ref; do
+  [ -z "$ns_ref" ] && continue
+  ns_count=$((ns_count + 1))
+  ns_name="${ns_ref#simple-workflow:}"
+  if [ ! -f "$REPO_DIR/agents/$ns_name.md" ] && [ ! -f "$REPO_DIR/skills/$ns_name/SKILL.md" ]; then
+    ns_dangling="$ns_dangling $ns_ref"
+  fi
+done <<<"$ns_refs"
+if [ "$ns_count" -ge 1 ] && [ -z "$ns_dangling" ]; then
+  echo -e "  ${GREEN}PASS${NC} all $ns_count namespaced simple-workflow:<name> references resolve to an agent or skill"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} dangling namespaced references (checked $ns_count):${ns_dangling:- none}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 8: Inline bash interpolation syntax ---
+# Skill markdown can include `!`<bash command>`` blocks that Claude Code executes.
+# Validate each interpolation parses with `bash -n` so a typo cannot ship undetected.
+echo "--- Inline bash interpolation syntax ---"
+
+for skill_md in "$REPO_DIR"/skills/*/SKILL.md; do
+  skill_slug=$(basename "$(dirname "$skill_md")")
+
+  # Extract every `!`...`` interpolation. Lines look like:  !`some bash`
+  # Use perl-compatible regex to capture everything between !` and `.
+  mapfile -t interpolations < <(grep -oE '!`[^`]+`' "$skill_md" | sed -E 's/^!`//; s/`$//')
+
+  if [ ${#interpolations[@]} -eq 0 ]; then
+    continue
+  fi
+
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  syntax_ok=1
+  bad_cmd=""
+  for cmd in "${interpolations[@]}"; do
+    if ! bash -n -c "$cmd" 2>/dev/null; then
+      syntax_ok=0
+      bad_cmd="$cmd"
+      break
+    fi
+  done
+
+  if [ $syntax_ok -eq 1 ]; then
+    echo -e "  ${GREEN}PASS${NC} skills/$skill_slug/SKILL.md inline bash interpolations parse (${#interpolations[@]} block(s))"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md has a bash interpolation that fails 'bash -n'"
+    echo -e "       Bad command: $bad_cmd"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+done
+
+echo ""
+
+# --- Category 9: Default-branch hardcode guard ---
+# Any literal reference to `origin/main` in skills/ (excluding the fallback
+# `|| echo main`, which uses `echo main` without the `origin/` prefix)
+# indicates a hardcoded default branch that will fatal on master/develop
+# repos. This catches the same class of bug as the /catchup + /ship fixes.
+echo "--- Default-branch hardcode guard ---"
+
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+# Allow: `|| echo main` (fallback), `fallback to main when origin/HEAD is not set` (doc prose)
+# Disallow: any literal `origin/main`
+HARDCODED=$(grep -RIn --include='*.md' 'origin/main' "$REPO_DIR/skills" 2>/dev/null || true)
+if [ -z "$HARDCODED" ]; then
+  echo -e "  ${GREEN}PASS${NC} skills/ has no literal 'origin/main' references"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} skills/ has literal 'origin/main' references:"
+  echo "$HARDCODED" | sed 's/^/       /'
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 10: Agent Status contract (vocabulary verification) ---
+# Every agent must publish a `**Status**:` contract line in its return format
+# so that orchestrator skills can parse a consistent structured return block.
+# This catches drift between the agent prompt and the parser contract.
+# In addition, verify the Status line is non-empty AND contains a recognizable
+# token from the known vocabulary set, to catch empty or garbage values.
+echo "--- Agent Status contract (vocabulary verification) ---"
+
+KNOWN_TOKENS='success|partial|failed|PASS|PASS-WITH-CAVEATS|FAIL|FAIL-CRITICAL|PASS_WITH_CONCERNS'
+
+for agent_md in \
+  "$REPO_DIR/agents/code-reviewer.md" \
+  "$REPO_DIR/agents/security-scanner.md" \
+  "$REPO_DIR/agents/ac-evaluator.md" \
+  "$REPO_DIR/agents/implementer.md" \
+  "$REPO_DIR/agents/researcher.md" \
+  "$REPO_DIR/agents/ticket-evaluator.md" \
+  "$REPO_DIR/agents/test-writer.md" \
+  "$REPO_DIR/agents/planner.md"; do
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  agent_basename=$(basename "$agent_md" .md)
+  if [ ! -f "$agent_md" ]; then
+    echo -e "  ${RED}FAIL${NC} $agent_basename.md does not exist"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    continue
+  fi
+  STATUS_LINE=$(grep -m1 -E '^\*\*Status\*\*:' "$agent_md" || true)
+  if [ -z "$STATUS_LINE" ]; then
+    echo -e "  ${RED}FAIL${NC} $agent_basename.md is missing '**Status**:' contract line"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    continue
+  fi
+  # Extract the value portion after "**Status**:"
+  STATUS_VALUES=$(echo "$STATUS_LINE" | sed -E 's/^\*\*Status\*\*:[[:space:]]*//')
+  if [ -z "$STATUS_VALUES" ] || [ "$STATUS_VALUES" = "$STATUS_LINE" ]; then
+    echo -e "  ${RED}FAIL${NC} $agent_basename.md has empty Status value"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    continue
+  fi
+  # Verify at least one known token appears
+  if grep -qE -- "($KNOWN_TOKENS)" <<<"$STATUS_VALUES"; then
+    echo -e "  ${GREEN}PASS${NC} $agent_basename.md Status vocabulary is recognized"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} $agent_basename.md Status value '$STATUS_VALUES' contains no known token ($KNOWN_TOKENS)"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+done
+
+echo ""
+
+# --- Category 11: tools: allowlist enumeration (v8.0.0 plane) ---
+#
+# v8.0.0 removed the `tools:` allowlist from the 4 productive Group A agents.
+# As a result:
+#   (a) No agent in agents/*.md may carry the literal `"Bash(*)"` entry under
+#       a frontmatter `tools:` allowlist. Group A omits the field entirely;
+#       Group C agents use either no Bash entry or scoped Bash(...) entries
+#       (e.g. Bash(git diff:*)). An unrestricted `"Bash(*)"` would silently
+#       widen a Group C agent's surface and is forbidden.
+#   (b) The set of agents whose frontmatter contains `^tools:` is exactly the
+#       7 Group C agents (ac-evaluator, code-reviewer, decomposer, doc-verifier,
+#       security-scanner, ticket-evaluator, tune-analyzer).
+#       PR-5 re-point: the count is 7, not 8 — the M5 opus twin of ac-evaluator
+#       (which copied its tools:) was retired.
+echo "--- tools: allowlist enumeration (v8.0.0) ---"
+
+# (a) Zero agents may declare the unrestricted "Bash(*)" entry.
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+bstar_files=$( { grep -rl '"Bash(\*)"' "$REPO_DIR"/agents/*.md 2>/dev/null || true; } | sort)
+bstar_count=$(echo -n "$bstar_files" | { grep -c . 2>/dev/null || true; })
+bstar_count=${bstar_count:-0}
+if [ "$bstar_count" -eq 0 ]; then
+  echo -e "  ${GREEN}PASS${NC} no agent frontmatter declares unrestricted \"Bash(*)\" (v8.0.0: Group A omits tools, Group C uses scoped Bash only)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} agent(s) still declare unrestricted \"Bash(*)\" (forbidden under v8.0.0): $(echo "$bstar_files" | tr '\n' ' ')"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# (b) Positive enumeration: the agents whose frontmatter contains `^tools:`
+# is exactly the 7 Group C agents. Compute the actual set and diff against
+# the expected set.
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+expected_tools_set=$(printf '%s\n' \
+  "ac-evaluator" \
+  "code-reviewer" \
+  "decomposer" \
+  "doc-verifier" \
+  "security-scanner" \
+  "ticket-evaluator" \
+  "tune-analyzer" | sort)
+
+actual_tools_set=$(
+  for agent_md in "$REPO_DIR"/agents/*.md; do
+    fm=$(awk '
+      BEGIN { fences=0 }
+      /^---[[:space:]]*$/ { fences++; if (fences==2) exit; next }
+      fences==1 { print }
+    ' "$agent_md")
+    if grep -qE -- '^tools:' <<<"$fm"; then
+      basename "$agent_md" .md
+    fi
+  done | sort
+)
+
+if [ "$actual_tools_set" = "$expected_tools_set" ]; then
+  echo -e "  ${GREEN}PASS${NC} the 7 agents with ^tools: in frontmatter are exactly Group C (ac-evaluator, code-reviewer, decomposer, doc-verifier, security-scanner, ticket-evaluator, tune-analyzer)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} agents with ^tools: do not match Group C"
+  echo -e "       expected: $(echo "$expected_tools_set" | tr '\n' ' ')"
+  echo -e "       actual:   $(echo "$actual_tools_set" | tr '\n' ' ')"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 12: /audit round=N contract ---
+echo "--- /audit round=N contract ---"
+
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if grep -qF 'round=N' "$REPO_DIR/skills/audit/SKILL.md" && grep -qF 'round={n}' "$REPO_DIR/skills/impl/SKILL.md"; then
+  echo -e "  ${GREEN}PASS${NC} /audit supports round=N and /impl passes round={n}"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} /audit round=N contract is missing or /impl does not pass round={n}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 13: Bash permission whitespace consistency ---
+echo "--- Bash permission whitespace consistency ---"
+
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+inconsistent=$( (grep -rE 'Bash\([a-z]+ :\*\)' "$REPO_DIR"/agents/ 2>/dev/null || true) | wc -l | tr -d ' ')
+if [ "$inconsistent" -eq 0 ]; then
+  echo -e "  ${GREEN}PASS${NC} No whitespace inconsistency in Bash(<cmd> :*) permissions"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} Found $inconsistent Bash(<cmd> :*) whitespace-mixed entries in agents/"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 14: catchup allowed-tools compliance ---
+echo "--- catchup allowed-tools compliance ---"
+
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+if ! grep -qE "grep.*\|.*sed" "$REPO_DIR/skills/catchup/SKILL.md"; then
+  echo -e "  ${GREEN}PASS${NC} catchup does not suggest grep|sed piping outside allowed-tools"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} catchup still contains grep|sed pipe example"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 15: CHANGELOG / plugin.json version consistency ---
+echo "--- CHANGELOG / plugin.json version consistency ---"
+
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+PLUGIN_VER=$(jq -r '.version' "$REPO_DIR/.claude-plugin/plugin.json")
+CHANGELOG_LATEST=$(grep -m1 -E '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' "$REPO_DIR/CHANGELOG.md" | sed -E 's/^## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/')
+if [ "$PLUGIN_VER" = "$CHANGELOG_LATEST" ]; then
+  echo -e "  ${GREEN}PASS${NC} plugin.json version ($PLUGIN_VER) matches latest CHANGELOG release ($CHANGELOG_LATEST)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} version mismatch: plugin.json=$PLUGIN_VER CHANGELOG=$CHANGELOG_LATEST"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 16: Default-branch pipe correctness ---
+echo "--- Default-branch pipe correctness ---"
+
+for skill_md in "$REPO_DIR"/skills/*/SKILL.md; do
+  skill_slug=$(basename "$(dirname "$skill_md")")
+
+  mapfile -t pipes < <(grep -oE '!`[^`]*git symbolic-ref[^`]*`' "$skill_md" | sed -E 's/^!`//; s/`$//')
+
+  if [ ${#pipes[@]} -eq 0 ]; then
+    continue
+  fi
+
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  all_ok=1
+  bad_pipe=""
+  for pipe in "${pipes[@]}"; do
+    if ! grep -qF -- '| grep .' <<<"$pipe"; then
+      all_ok=0
+      bad_pipe="$pipe"
+      break
+    fi
+  done
+
+  if [ $all_ok -eq 1 ]; then
+    echo -e "  ${GREEN}PASS${NC} skills/$skill_slug/SKILL.md git symbolic-ref pipes include '| grep .'"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md git symbolic-ref pipe missing '| grep .'"
+    echo -e "       Bad pipe: $bad_pipe"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+done
+
+echo ""
+
+# --- Category 17: Step number continuity ---
+# NOTE (PR E Task 3): NNa/NNb branch steps are accepted as valid
+# continuations of step NN. /ship and /impl use them to insert inline
+# sub-steps (e.g. 15a "Complete ship phase state update") without shifting
+# every subsequent step's number. Only the primary numbered sequence
+# (1, 2, 3, ...) must remain sequential with no gaps; branch steps are
+# skipped during the gap scan.
+echo "--- Step number continuity ---"
+
+for skill_md in \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  "$REPO_DIR/skills/impl/SKILL.md"; do
+  skill_slug=$(basename "$(dirname "$skill_md")")
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+
+  mapfile -t steps < <(grep -nE '^[0-9]+[a-z]?\.' "$skill_md" | sed -E 's/:([0-9]+[a-z]?)\..*/:\1/')
+
+  if [ ${#steps[@]} -eq 0 ]; then
+    echo -e "  ${GREEN}PASS${NC} skills/$skill_slug/SKILL.md has no top-level steps (skipped)"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    continue
+  fi
+
+  has_gap=0
+  bad_detail=""
+  prev_num=0
+  for entry in "${steps[@]}"; do
+    line_no="${entry%%:*}"
+    step_id="${entry##*:}"
+    # Branch steps (e.g. 15a, 15b) annotate step 15 inline; accept them and
+    # skip the gap scan for that entry. They do not advance prev_num.
+    if grep -qE -- '[a-z]$' <<<"$step_id"; then
+      continue
+    fi
+    num="$step_id"
+    if [ "$prev_num" -gt 0 ] && [ "$num" -ne $((prev_num + 1)) ] && [ "$num" -ne 1 ]; then
+      has_gap=1
+      bad_detail="gap: step $prev_num -> $num at line $line_no"
+      break
+    fi
+    prev_num=$num
+  done
+
+  if [ "$has_gap" -eq 0 ]; then
+    echo -e "  ${GREEN}PASS${NC} skills/$skill_slug/SKILL.md steps are sequential (1..$prev_num; NNa/NNb branch steps accepted)"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md step numbering issue: $bad_detail"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+done
+
+echo ""
+
+# --- Category 18: Phase-step alignment ---
+echo "--- Phase-step alignment ---"
+
+for skill_md in \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  "$REPO_DIR/skills/impl/SKILL.md"; do
+  skill_slug=$(basename "$(dirname "$skill_md")")
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+
+  phase_ok=1
+  bad_detail=""
+  prev_last_step=0
+
+  while IFS= read -r line; do
+    line_no=$(echo "$line" | cut -d: -f1)
+    first_step=$(awk -v start="$line_no" 'NR > start && /^[0-9]+\./ { sub(/\..*/, ""); print; exit }' "$skill_md")
+    if [ -z "$first_step" ]; then
+      continue
+    fi
+
+    if [ "$prev_last_step" -gt 0 ] && [ "$first_step" -ne $((prev_last_step + 1)) ]; then
+      phase_ok=0
+      bad_detail="Phase at line $line_no starts at step $first_step, expected $((prev_last_step + 1))"
+      break
+    fi
+
+    next_phase_line=$(awk -v start="$line_no" 'NR > start && /^## Phase/ { print NR; exit }' "$skill_md")
+    if [ -n "$next_phase_line" ]; then
+      prev_last_step=$(awk -v start="$line_no" -v end="$next_phase_line" 'NR > start && NR < end && /^[0-9]+\./ { sub(/\..*/, ""); last=$0 } END { print last+0 }' "$skill_md")
+    else
+      prev_last_step=$(awk -v start="$line_no" 'NR > start && /^[0-9]+\./ { sub(/\..*/, ""); last=$0 } END { print last+0 }' "$skill_md")
+    fi
+  done < <(grep -nE '^## Phase' "$skill_md")
+
+  if [ "$phase_ok" -eq 1 ]; then
+    echo -e "  ${GREEN}PASS${NC} skills/$skill_slug/SKILL.md phase-step alignment is correct"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md phase-step misalignment: $bad_detail"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+done
+
+echo ""
+
+# --- Category 19: allowed-tools vs body Bash usage consistency ---
+echo "--- allowed-tools vs body Bash usage consistency ---"
+
+for skill_md in "$REPO_DIR"/skills/*/SKILL.md; do
+  skill_slug=$(basename "$(dirname "$skill_md")")
+
+  # Skip delegator skills with agent: field (they delegate to an agent that has Bash)
+  if grep -qE '^agent:' "$skill_md"; then
+    continue
+  fi
+
+  has_bash_in_tools=$(awk '
+    BEGIN{in_fm=0;depth=0;found=0}
+    /^---/{depth++;if(depth==1){in_fm=1;next};if(depth==2){exit}}
+    in_fm && /Bash/{found=1}
+    END{print found}
+  ' "$skill_md")
+
+  # Check body (after frontmatter) for shell command invocation patterns
+  # Exclude !` interpolations (pre-computed context, handled by platform)
+  # shellcheck disable=SC2034
+  body_bash=$( awk 'BEGIN{depth=0} /^---/{depth++;next} depth>=2{print}' "$skill_md" \
+    | { grep -cvE '^!' || true; } \
+    | head -1 )
+  # More targeted: look for "Run `git/gh/ls/mkdir" patterns in body
+  # Exclude !` interpolation lines (pre-computed context, not agent shell instructions)
+  body_shell_refs=$( awk 'BEGIN{depth=0} /^---/{depth++;next} depth>=2{print}' "$skill_md" \
+    | grep -vE '^!' \
+    | { grep -cE '`(git |gh |npm |npx |cargo |go |make |pytest |bash )' || true; } )
+
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  if [ "$has_bash_in_tools" -eq 0 ] && [ "$body_shell_refs" -gt 3 ]; then
+    echo -e "  ${RED}FAIL${NC} skills/$skill_slug/SKILL.md body has $body_shell_refs shell refs but allowed-tools has no Bash"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  else
+    echo -e "  ${GREEN}PASS${NC} skills/$skill_slug/SKILL.md allowed-tools vs body Bash usage is consistent"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  fi
+done
+
+echo ""
+
+# --- Category 20: catchup tickets field documentation ---
+echo "--- catchup tickets field documentation ---"
+
+assert_file_contains \
+  "catchup/SKILL.md documents tickets: field" \
+  "$REPO_DIR/skills/catchup/SKILL.md" \
+  'tickets'
+
+assert_file_contains \
+  "catchup/SKILL.md documents per-ticket dir field" \
+  "$REPO_DIR/skills/catchup/references/compact-state-schema.md" \
+  '- dir:'
+
+assert_file_contains \
+  "catchup/SKILL.md documents per-ticket in_progress_phase" \
+  "$REPO_DIR/skills/catchup/SKILL.md" \
+  'in_progress_phase'
+
+echo ""
+
+# --- Category 21: ticket-slug regression guard (cross-skill) ---
+echo "--- ticket-slug regression guard (cross-skill) ---"
+
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+TICKET_SLUG_HITS=$(grep -rE '\{ticket-slug\}' "$REPO_DIR/skills/" --include='*.md' 2>/dev/null || true)
+if [ -z "$TICKET_SLUG_HITS" ]; then
+  echo -e "  ${GREEN}PASS${NC} skills/ has no stale {ticket-slug} references"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} skills/ has stale {ticket-slug} references:"
+  echo "$TICKET_SLUG_HITS" | sed 's/^/       /'
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 22: ticket-dir= propagation contract ---
+echo "--- ticket-dir= propagation contract ---"
+
+assert_file_contains \
+  "audit/SKILL.md argument-hint includes ticket-dir=" \
+  "$REPO_DIR/skills/audit/SKILL.md" \
+  "argument-hint:.*ticket-dir="
+
+assert_file_contains \
+  "ship/SKILL.md argument-hint includes ticket-dir=" \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  "argument-hint:.*ticket-dir="
+
+assert_file_contains \
+  "impl/SKILL.md Step 17 passes ticket-dir= to /audit" \
+  "$REPO_DIR/skills/impl/SKILL.md" \
+  "pass.*ticket-dir=.*\/audit"
+
+assert_file_contains \
+  "refactor/SKILL.md argument-hint includes ticket-dir=" \
+  "$REPO_DIR/skills/refactor/SKILL.md" \
+  "argument-hint:.*ticket-dir="
+
+assert_file_contains \
+  "autopilot/SKILL.md passes ticket-dir={ticket-dir} to /ship" \
+  "$REPO_DIR/skills/autopilot/SKILL.md" \
+  "ticket-dir=\{ticket-dir\}"
+
+assert_file_contains \
+  "autopilot/SKILL.md contains ARTIFACT-MISSING handling" \
+  "$REPO_DIR/skills/autopilot/SKILL.md" \
+  "ARTIFACT-MISSING"
+
+echo ""
+
+# --- Category 23: ticket-dir= semantic verification ---
+echo "--- ticket-dir= semantic verification ---"
+
+# AC1: Both /audit and /ship argument-hint lines use <dir-name> format (not <path>)
+assert_file_contains \
+  "audit/SKILL.md argument-hint uses ticket-dir=<dir-name> format" \
+  "$REPO_DIR/skills/audit/SKILL.md" \
+  'argument-hint:.*ticket-dir=<dir-name>'
+
+assert_file_contains \
+  "ship/SKILL.md argument-hint uses ticket-dir=<dir-name> format" \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  'argument-hint:.*ticket-dir=<dir-name>'
+
+assert_file_contains \
+  "refactor/SKILL.md argument-hint uses ticket-dir=<dir-name> format" \
+  "$REPO_DIR/skills/refactor/SKILL.md" \
+  'argument-hint:.*ticket-dir=<dir-name>'
+
+# AC2: /impl's ticket-dir= pass to /audit uses bare name format (not full path)
+assert_file_not_contains \
+  "impl/SKILL.md does NOT pass ticket-dir=.simple-workflow/backlog (no full path leak)" \
+  "$REPO_DIR/skills/impl/SKILL.md" \
+  'ticket-dir=\.simple-workflow/backlog'
+
+# AC3: Artifact verification ordering — phase-guarded for Phase E
+# AC3: Artifact verification ordering — ARTIFACT-MISSING appears before State update (after)
+TESTS_TOTAL=$((TESTS_TOTAL + 1))
+autopilot_file="$REPO_DIR/skills/autopilot/SKILL.md"
+ordering_ok=1
+bad_ordering=""
+while IFS=: read -r artifact_lineno _rest; do
+  next_state_after=$(awk -v start="$artifact_lineno" 'NR > start && /State update \(after\)/ { print NR; exit }' "$autopilot_file")
+  if [ -z "$next_state_after" ]; then
+    ordering_ok=0
+    bad_ordering="ARTIFACT-MISSING at line $artifact_lineno has no subsequent State update (after)"
+    break
+  fi
+done < <(grep -n 'ARTIFACT-MISSING' "$autopilot_file")
+
+if [ "$ordering_ok" -eq 1 ]; then
+  artifact_count=$(count_matches 'ARTIFACT-MISSING' "$autopilot_file")
+  echo -e "  ${GREEN}PASS${NC} autopilot/SKILL.md all $artifact_count ARTIFACT-MISSING blocks appear before their State update (after)"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "  ${RED}FAIL${NC} autopilot/SKILL.md ARTIFACT-MISSING ordering violation: $bad_ordering"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# --- Category 24: /ship Step 3b — gitignore handles .simple-workflow/ exclusion ---
+# v4.1.0 (commit 01b7584) intentionally removed the explicit briefs-exclusion
+# clause from ship/SKILL.md Step 3.b: `.simple-workflow/` is gitignored via
+# hooks/session-start.sh setup, so an in-prose carve-out is redundant. This
+# assertion guards the new contract — the literal substring
+# `.simple-workflow/backlog/briefs/` MUST NOT reappear in ship/SKILL.md
+# (gitignore is the single mechanism).
+echo "--- /ship Step 3b stages all relevant files (no briefs exclusion clause; gitignore handles it) ---"
+
+assert_file_not_contains \
+  "ship/SKILL.md Step 3b stages all relevant files (no .simple-workflow/backlog/briefs/ exclusion clause; gitignore handles it)" \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  '\.simple-workflow/backlog/briefs/'
+
+echo ""
+
+# --- Category 25: post-/ship path-rewrite drift on three reference surfaces ---
+#
+# After /ship moves a ticket from .simple-workflow/backlog/active/<slug>/<ticket-id>/
+# (or .../product_backlog/<slug>/<ticket-id>/) into .simple-workflow/backlog/done/,
+# three other surfaces still embed the OLD source-path string:
+#
+#   1. .simple-workflow/backlog/done/<slug>/<ticket-id>/audit-round-*.md
+#   2. <briefs-done>/<slug>/autopilot-state.yaml (the moved ticket's
+#      tickets[].ticket_dir entry)
+#   3. .simple-workflow/backlog/done/<slug>/<ticket-id>/autopilot-log.md
+#
+# The /ship skill (skills/ship/SKILL.md, Phase 1 step 5d) is the documented
+# rewriter. This category invokes the regression scanner
+# (tests/helpers/check-ticket-move-drift.sh) against synthetic fixtures and
+# verifies the contract:
+#
+# - clean fixture           -> exit 0 (AC 6)
+# - active-residual fixture -> exit 1, stderr contains 'drift:' (AC 7)
+# - product_backlog residual -> exit 1, stderr contains 'drift:' (Edge Case 1)
+# - fenced-only residual    -> exit 0 (Negative AC 1)
+# - cross-ticket residual   -> exit 0 (Negative AC 2)
+# - absent audit reports    -> exit 0 (Negative AC 3)
+# - HTML-comment-only       -> exit 0 (Negative AC 4)
+# - regex-in-fence          -> exit 0 (Edge Case 3)
+# - idempotent rerun        -> exit 0, zero 'drift:' on stderr (Edge Case 2)
+echo "--- post-/ship path-rewrite drift on three reference surfaces ---"
+
+DRIFT_PROBE="$REPO_DIR/tests/helpers/check-ticket-move-drift.sh"
+FIXTURE_SLUG="sample-slug"
+FIXTURE_TID="001-add-search"
+
+# build_clean_fixture <fixture-root>
+#
+# All three surfaces present, all using the NEW done path. No residual
+# OLD-path substring anywhere in prose.
+build_clean_fixture() {
+  local root="$1"
+  local done_dir="$root/.simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID"
+  local briefs_dir="$root/.simple-workflow/backlog/briefs/done/$FIXTURE_SLUG"
+  mkdir -p "$done_dir" "$briefs_dir"
+  cat > "$done_dir/audit-round-1.md" <<MD
+# Audit round 1
+Ticket lives at .simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/.
+MD
+  cat > "$done_dir/autopilot-log.md" <<MD
+# Autopilot log
+Final location: .simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/.
+MD
+  cat > "$briefs_dir/autopilot-state.yaml" <<YML
+version: 1
+parent_slug: $FIXTURE_SLUG
+tickets:
+  - logical_id: $FIXTURE_SLUG-part-1
+    ticket_dir: .simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/
+    status: completed
+YML
+}
+
+# run_drift_probe <fixture-root> <description> <expected-exit> <expect-drift-stderr>
+#
+# expected-exit       : "0" or "nonzero"
+# expect-drift-stderr : "yes" or "no" — whether stderr should contain 'drift:'
+run_drift_probe() {
+  local root="$1"
+  local desc="$2"
+  local expected="$3"
+  local expect_drift="$4"
+
+  local stderr_file
+  stderr_file=$(mktemp)
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+
+  set +e
+  bash "$DRIFT_PROBE" "$root" "$FIXTURE_SLUG" "$FIXTURE_TID" 2>"$stderr_file" >/dev/null
+  local rc=$?
+  set -e
+
+  local stderr_content
+  stderr_content=$(cat "$stderr_file")
+  rm -f "$stderr_file"
+
+  local exit_ok=0
+  if [ "$expected" = "0" ] && [ "$rc" -eq 0 ]; then
+    exit_ok=1
+  elif [ "$expected" = "nonzero" ] && [ "$rc" -ne 0 ]; then
+    exit_ok=1
+  fi
+
+  local drift_ok=0
+  local drift_seen="no"
+  if grep -qF -- "drift:" <<<"$stderr_content"; then
+    drift_seen="yes"
+  fi
+  if [ "$expect_drift" = "$drift_seen" ]; then
+    drift_ok=1
+  fi
+
+  if [ "$exit_ok" -eq 1 ] && [ "$drift_ok" -eq 1 ]; then
+    echo -e "  ${GREEN}PASS${NC} $desc"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} $desc"
+    [ "$exit_ok" -ne 1 ] && echo -e "       expected exit=$expected, got rc=$rc"
+    [ "$drift_ok" -ne 1 ] && echo -e "       expected drift_in_stderr=$expect_drift, got=$drift_seen"
+    [ -n "$stderr_content" ] && echo -e "       stderr: $stderr_content"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+}
+
+# 25.1 Clean fixture: all three surfaces use the NEW done path -> exit 0.
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  run_drift_probe "$fix" "clean fixture (all three surfaces NEW-path) -> exit 0 (AC 6)" "0" "no"
+  rm -rf "$fix"
+}
+
+# 25.2 Active-residual: audit-round-1.md still references the OLD active path
+#      in prose -> exit non-zero with 'drift:' on stderr.
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  cat >> "$fix/.simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/audit-round-1.md" <<MD
+Stale prose: was .simple-workflow/backlog/active/$FIXTURE_SLUG/$FIXTURE_TID/ before move.
+MD
+  run_drift_probe "$fix" "active-residual in audit -> exit nonzero + 'drift:' on stderr (AC 7)" "nonzero" "yes"
+  rm -rf "$fix"
+}
+
+# 25.3 product_backlog-residual: same as 25.2 but with the product_backlog form.
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  cat >> "$fix/.simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/audit-round-1.md" <<MD
+Stale prose: was .simple-workflow/backlog/product_backlog/$FIXTURE_SLUG/$FIXTURE_TID/ before move.
+MD
+  run_drift_probe "$fix" "product_backlog-residual in audit -> exit nonzero + 'drift:' on stderr (Edge Case 1)" "nonzero" "yes"
+  rm -rf "$fix"
+}
+
+# 25.4 Fenced-only: OLD path appears only inside a triple-backtick fenced
+#      block -> exit 0 (Negative AC 1).
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  cat >> "$fix/.simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/audit-round-1.md" <<MD
+
+\`\`\`
+example: .simple-workflow/backlog/active/$FIXTURE_SLUG/$FIXTURE_TID/ was the OLD path
+\`\`\`
+MD
+  run_drift_probe "$fix" "fenced-only OLD-path occurrence -> exit 0 (Negative AC 1)" "0" "no"
+  rm -rf "$fix"
+}
+
+# 25.5 Cross-ticket: audit references a DIFFERENT ticket's active path
+#      (different slug AND different ticket-id) -> exit 0 (Negative AC 2).
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  cat >> "$fix/.simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/audit-round-1.md" <<MD
+Cross-ref: see .simple-workflow/backlog/active/other-slug/002-other-ticket/ for context.
+MD
+  run_drift_probe "$fix" "cross-ticket residual -> exit 0 (Negative AC 2)" "0" "no"
+  rm -rf "$fix"
+}
+
+# 25.6 Absent audit reports: clean fixture but no audit-round-*.md at all
+#      -> exit 0 (Negative AC 3).
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  rm -f "$fix/.simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/audit-round-1.md"
+  run_drift_probe "$fix" "absent audit reports -> exit 0 (Negative AC 3)" "0" "no"
+  rm -rf "$fix"
+}
+
+# 25.7 HTML-comment-only in autopilot-log.md: OLD path appears only inside
+#      <!-- ... --> -> exit 0 (Negative AC 4).
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  cat >> "$fix/.simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/autopilot-log.md" <<MD
+<!-- historical: previously at .simple-workflow/backlog/active/$FIXTURE_SLUG/$FIXTURE_TID/ -->
+MD
+  run_drift_probe "$fix" "HTML-comment-only residual in log -> exit 0 (Negative AC 4)" "0" "no"
+  rm -rf "$fix"
+}
+
+# 25.8 Regex example inside a fenced block -> exit 0 (Edge Case 3).
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  cat >> "$fix/.simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/audit-round-1.md" <<MD
+
+\`\`\`regex
+\\.simple-workflow/backlog/active/
+\`\`\`
+MD
+  run_drift_probe "$fix" "regex example in fenced block -> exit 0 (Edge Case 3)" "0" "no"
+  rm -rf "$fix"
+}
+
+# 25.9 Idempotent re-move: a clean fixture stays clean on the second probe
+#      (zero 'drift:' substring on stderr) -> exit 0 (Edge Case 2).
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  # First probe — establish baseline.
+  bash "$DRIFT_PROBE" "$fix" "$FIXTURE_SLUG" "$FIXTURE_TID" 2>/dev/null >/dev/null || true
+  # Second probe — must remain clean.
+  run_drift_probe "$fix" "idempotent re-move (clean fixture, second probe) -> exit 0 + zero 'drift:' (Edge Case 2)" "0" "no"
+  rm -rf "$fix"
+}
+
+# 25.10 Cross-ticket entry inside the brief-side autopilot-state.yaml is not
+#       flagged: another ticket's active path coexists with the moved ticket's
+#       new done path, scoped scan must ignore the cross-ticket entry.
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  cat >> "$fix/.simple-workflow/backlog/briefs/done/$FIXTURE_SLUG/autopilot-state.yaml" <<YML
+  - logical_id: $FIXTURE_SLUG-part-2
+    ticket_dir: .simple-workflow/backlog/active/$FIXTURE_SLUG/002-other-ticket/
+    status: pending
+YML
+  run_drift_probe "$fix" "cross-ticket entry in state file -> exit 0 (moved-ticket scope)" "0" "no"
+  rm -rf "$fix"
+}
+
+# 25.11 Direct value-shape check: clean fixture's autopilot-state.yaml carries
+#       the literal NEW-path with trailing slash for the moved ticket (AC 4).
+{
+  fix=$(mktemp -d)
+  build_clean_fixture "$fix"
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  state_file="$fix/.simple-workflow/backlog/briefs/done/$FIXTURE_SLUG/autopilot-state.yaml"
+  expected_value=".simple-workflow/backlog/done/$FIXTURE_SLUG/$FIXTURE_TID/"
+  if grep -qF "ticket_dir: $expected_value" "$state_file"; then
+    echo -e "  ${GREEN}PASS${NC} state file's ticket_dir uses NEW done path with trailing slash (AC 4)"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+  else
+    echo -e "  ${RED}FAIL${NC} state file's ticket_dir does NOT use NEW done path with trailing slash (AC 4)"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+  rm -rf "$fix"
+}
+
+# 25.12 ship/SKILL.md documents the post-move path-rewrite contract for the
+#       three surfaces. The skill is the documented rewriter; this assertion
+#       guards against the contract clause being silently removed.
+assert_file_contains \
+  "ship/SKILL.md Phase 1 step 5d documents post-move path rewrite" \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  "Post-move path rewrite"
+
+assert_file_contains \
+  "ship/SKILL.md step 5d names audit-round-*.md as a rewrite surface" \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  "audit-round-\*\.md"
+
+assert_file_contains \
+  "ship/SKILL.md step 5d names autopilot-state.yaml as a rewrite surface" \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  "autopilot-state\.yaml"
+
+assert_file_contains \
+  "ship/SKILL.md step 5d names autopilot-log.md as a rewrite surface" \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  "autopilot-log\.md"
+
+assert_file_contains \
+  "ship/SKILL.md step 5d documents fenced/HTML-comment carve-out" \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  "fenced code blocks"
+
+assert_file_contains \
+  "ship/SKILL.md step 5d documents idempotent property" \
+  "$REPO_DIR/skills/ship/SKILL.md" \
+  "[Ii]dempotent"
+
+echo ""
+
+print_summary
